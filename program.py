@@ -36,6 +36,7 @@ Un registro grande se fragmenta en varios slots
 """
 
 import csv
+import io
 import json
 import re
 import struct
@@ -335,12 +336,11 @@ class Disk:
 
     def read_record(self, fragments: list[tuple[int, int]]) -> bytes:
         """Reconstruye el registro leyendo cada (page_id, slot_idx)."""
-        data = b""
-        for pid, slot_idx in fragments:
-            page = self._pages.get(pid)
-            if page:
-                data += page.read(slot_idx)
-        return data
+        return b"".join(
+            page.read(slot_idx)
+            for pid, slot_idx in fragments
+            if (page := self._pages.get(pid))
+        )
 
     def get_page(self, pid: int) -> Optional[SlottedPage]:
         return self._pages.get(pid)
@@ -1053,10 +1053,16 @@ class DatabaseManager:
         DELIMITADOR (auto-detectado):
           , ; \\t | :   — detecta el más consistente en las primeras 5 líneas
 
+        CABECERA (auto-detectada):
+          Se compara la primera fila con los nombres de columna del esquema
+          (insensible a mayúsculas y espacios). Si coincide → tiene cabecera.
+          Si no coincide → sin cabecera: se mapean las columnas del schema
+          en orden posicional. Nunca se usan nombres genéricos col_0, col_1.
+
         COLUMNAS:
           - Extra en CSV  → ignoradas, aviso
           - Faltantes del esquema → valor vacío, aviso
-          - Sin cabecera  → avisa, usa col_0 col_1 col_2 ...
+          - Sin cabecera  → mapeo posicional usando nombres del schema SQL
 
         FILAS:
           - PK duplicada  → omite la segunda, avisa
@@ -1087,44 +1093,65 @@ class DatabaseManager:
             else:
                 f.seek(0)
                 sample = ""
-
             content = sample + f.read()
 
-        # ── 4. Parsear con csv.DictReader ────────────────────────────────
-        import io
-        reader_f = io.StringIO(content)
-        reader   = csv.DictReader(reader_f, delimiter=delimiter)
+        # ── 4. Leer primera fila para detectar cabecera ───────────────────
+        reader_f   = io.StringIO(content)
+        first_row  = next(csv.reader(reader_f, delimiter=delimiter), [])
+        schema_names = [c.name for c in self.schema.columns]
 
-        # ── 5. Verificar cabeceras ────────────────────────────────────────
-        fieldnames = reader.fieldnames or []
+        def _normalise(s: str) -> str:
+            """Quita espacios, BOM y pasa a minúsculas para comparar."""
+            return s.strip().lstrip("\ufeff").lower()
 
-        # ¿Sin cabecera? Heurística: si los campos parecen datos numéricos
-        # o muy cortos sin letras, probablemente no hay cabecera.
-        def _looks_like_header(fields: list[str]) -> bool:
-            if not fields:
-                return False
-            # Si todos los campos son números → no es cabecera
-            all_numeric = all(re.match(r'^-?\d+(\.\d+)?$', f.strip())
-                              for f in fields if f.strip())
-            return not all_numeric
+        first_row_norm   = [_normalise(f) for f in first_row]
+        schema_names_norm = [_normalise(n) for n in schema_names]
 
-        if not _looks_like_header(fieldnames):
-            warnings.append(
-                "El CSV parece no tener fila de encabezado. "
-                "Se usarán nombres automáticos: col_0, col_1, ..."
-            )
+        # Tiene cabecera si al menos la MITAD de los campos de la primera fila
+        # coinciden con nombres de columna del schema (comparación insensible).
+        # Esto es robusto: funciona aunque el CSV tenga columnas extra o falten.
+        if schema_names_norm and first_row_norm:
+            schema_set  = set(schema_names_norm)
+            matches     = sum(1 for f in first_row_norm if f in schema_set)
+            has_header  = matches >= max(1, len(schema_names_norm) // 2)
+        else:
+            has_header = False
+
+        # ── 5. Construir DictReader con los fieldnames correctos ──────────
+        reader_f.seek(0)
+
+        if has_header:
+            # La primera fila es la cabecera: DictReader la usa directamente
+            reader     = csv.DictReader(reader_f, delimiter=delimiter)
+            fieldnames = [_normalise(f) for f in (reader.fieldnames or [])]
+            # Re-crear con nombres normalizados para que el mapeo funcione
             reader_f.seek(0)
-            n_cols = len(fieldnames) if fieldnames else 1
-            auto_names = [f"col_{i}" for i in range(n_cols)]
-            reader = csv.DictReader(reader_f, fieldnames=auto_names,
+            reader_f.readline()   # saltar la fila de cabecera original
+            reader = csv.DictReader(reader_f,
+                                    fieldnames=fieldnames,
                                     delimiter=delimiter)
-            fieldnames = auto_names
+        else:
+            # Sin cabecera: mapear posicionalmente usando nombres del schema.
+            # Si el CSV tiene MÁS columnas que el schema → nombres extra col_N.
+            n_csv_cols   = len(first_row)
+            if n_csv_cols > len(schema_names):
+                extra_names = [f"_col_{i}" for i in range(len(schema_names),
+                                                           n_csv_cols)]
+                fieldnames  = schema_names + extra_names
+            else:
+                fieldnames = schema_names[:n_csv_cols]
 
-        # Limpiar nombres de campo (quitar BOM residual, espacios)
-        clean_fields = [f.strip().lstrip("\ufeff") for f in fieldnames]
+            reader = csv.DictReader(reader_f,
+                                    fieldnames=fieldnames,
+                                    delimiter=delimiter)
+            warnings.append(
+                "CSV sin fila de cabecera — columnas mapeadas por posición "
+                f"usando el esquema SQL: {', '.join(schema_names)}"
+            )
 
-        schema_cols  = {c.name for c in self.schema.columns}
-        csv_cols_set = set(clean_fields)
+        # ── 6. Verificar cobertura de columnas ────────────────────────────
+        schema_cols  = set(schema_names)
+        csv_cols_set = set(fieldnames)
 
         missing = schema_cols - csv_cols_set
         if missing:
@@ -1132,7 +1159,7 @@ class DatabaseManager:
                 f"Columnas del esquema ausentes en el CSV "
                 f"(se usará vacío): {', '.join(sorted(missing))}"
             )
-        extra = csv_cols_set - schema_cols
+        extra = {f for f in csv_cols_set if not f.startswith("_col_")} - schema_cols
         if extra:
             warnings.append(
                 f"Columnas del CSV no presentes en el esquema "
@@ -1147,13 +1174,13 @@ class DatabaseManager:
         elif encoding not in ("utf-8", "utf-8-sig"):
             warnings.append(f"Encoding detectado: {encoding}")
 
-        # ── 6. Iterar filas ───────────────────────────────────────────────
-        pk_col       = self.schema.pk_column
-        dup_pks: int = 0
+        # ── 7. Iterar filas ───────────────────────────────────────────────
+        pk_col        = self.schema.pk_column
+        dup_pks: int  = 0
         err_rows: int = 0
 
         for line_num, raw_row in enumerate(reader, start=2):
-            # Remap: limpiar nombres de campo de la fila
+            # Limpiar nombres de campo de la fila
             row = {
                 k.strip().lstrip("\ufeff"): v
                 for k, v in (raw_row or {}).items()
@@ -1177,15 +1204,16 @@ class DatabaseManager:
                 if pk_val == "" or pk_val is None:
                     pk_val = f"__auto_{self.records_loaded}"
                     casted[pk_col] = pk_val
-                    warnings.append(
-                        f"Fila {line_num}: PK vacía — asignada clave "
-                        f"automática '{pk_val}'."
-                    ) if self.records_loaded < 5 else None  # max 5 avisos
+                    if self.records_loaded < 5:
+                        warnings.append(
+                            f"Fila {line_num}: PK vacía — asignada clave "
+                            f"automática '{pk_val}'."
+                        )
 
                 # PK duplicada → omitir
                 if pk_val in self._records:
                     dup_pks += 1
-                    if dup_pks <= 5:   # mostrar solo los primeros 5
+                    if dup_pks <= 5:
                         warnings.append(
                             f"Fila {line_num}: PK duplicada '{pk_val}' — omitida."
                         )
@@ -2051,6 +2079,9 @@ class App(ctk.CTk):
         pop.resizable(True, True)
         pop.geometry("640x560")
         pop.minsize(500, 320)
+
+        pop.wait_visibility()
+
         pop.grab_set()
 
         # ── Contenedor scrollable ──────────────────────────────────────────
