@@ -294,12 +294,21 @@ class Disk:
     def write_record(self, data: bytes) -> list[tuple[int, int]]:
         """
         Escribe `data` distribuyéndola en slots de páginas.
-        Un registro grande se reparte en varios fragmentos.
-        El espacio libre de una página se aprovecha al máximo
-        antes de abrir una nueva → cero padding desperdiciado.
-
-        Retorna lista de (page_id, slot_idx) para cada fragmento.
+        Pre-flight check: valida si el registro completo cabe en el disco
+        antes de realizar cualquier inserción física (garantiza atomicidad).
         """
+        current_free = self._current_page().free_space
+        remaining_pages = self.config.total_sectors - self._next_pid - 1
+        
+        max_payload_per_page = self.config.usable_bytes - SLOT_SIZE
+        total_available_bytes = current_free + (remaining_pages * max_payload_per_page)
+
+        if len(data) > total_available_bytes:
+            raise OverflowError(
+                f"Disco lleno: se requieren {len(data)}B pero "
+                f"solo quedan {total_available_bytes}B disponibles."
+            )
+
         fragments: list[tuple[int, int]] = []
         pos = 0
 
@@ -308,6 +317,7 @@ class Disk:
 
             # ¿cabe algo en la página actual?
             avail = page.free_space
+            
             if avail <= 0:
                 # abrir nueva página y encadenar
                 new_pid = self._allocate_page()
@@ -318,14 +328,9 @@ class Disk:
 
             chunk     = data[pos:pos + avail]
             slot_idx  = page.insert(chunk)
+            
             if slot_idx is None:
-                # No debería ocurrir: free_space > 0 pero insert falló.
-                # En lugar de loop infinito, lanzamos excepción descriptiva.
-                raise RuntimeError(
-                    f"Error interno: página {self._current_pid} reportó "
-                    f"{avail}B libres pero insert() falló. "
-                    f"Posible corrupción de página."
-                )
+                raise RuntimeError("Error de coherencia de espacio en SlottedPage.")
 
             fragments.append((self._current_pid, slot_idx))
             pos += len(chunk)
