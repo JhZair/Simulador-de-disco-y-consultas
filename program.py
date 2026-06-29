@@ -1,4 +1,4 @@
-"""
+"""06/29/2026 4:16pm
 Simulación de Almacenamiento Físico de Base de Datos
 CustomTkinter · Windows 11 · Python 3.12
 
@@ -210,6 +210,33 @@ class SlottedPage:
         self.slots.append((offset, len(fragment)))
         return len(self.slots) - 1
 
+    # ── eliminar fragmento (para rollback) ───────────────────────────────────
+
+    def delete(self, slot_idx: int) -> bool:
+        """
+        Libera el slot `slot_idx` para rollback de escrituras parciales.
+
+        Si es el último slot (caso típico de rollback atómico), retrocede
+        free_ptr y elimina el slot → recupera espacio real.
+        Si está en medio, lo marca con length=0 (espacio no recuperable
+        sin compactación — análogo a un DELETE en página fragmentada).
+
+        Retorna True si se liberó espacio real, False si solo se marcó.
+        """
+        if slot_idx >= len(self.slots):
+            return False
+        offset, length = self.slots[slot_idx]
+        if slot_idx == len(self.slots) - 1:
+            # Último slot: retroceder el puntero y eliminar el slot
+            self.free_ptr = offset
+            self.slots.pop()
+            self.data[offset:offset + length] = bytes(length)
+            return True
+        else:
+            # Slot en medio: marcar como eliminado (length=0)
+            self.slots[slot_idx] = (offset, 0)
+            return False
+
     # ── leer fragmento ────────────────────────────────────────────────────────
 
     def read(self, slot_idx: int) -> bytes:
@@ -294,46 +321,68 @@ class Disk:
     def write_record(self, data: bytes) -> list[tuple[int, int]]:
         """
         Escribe `data` distribuyéndola en slots de páginas.
-        Pre-flight check: valida si el registro completo cabe en el disco
-        antes de realizar cualquier inserción física (garantiza atomicidad).
+        Un registro grande se reparte en varios fragmentos.
+        El espacio libre de una página se aprovecha al máximo
+        antes de abrir una nueva → cero padding desperdiciado.
+
+        ATOMICIDAD (comportamiento SGBD profesional):
+          Si el disco se llena a mitad de escritura, se hace rollback
+          de todos los fragmentos parciales ya escritos antes de lanzar
+          OverflowError. El disco queda en el mismo estado que antes
+          de llamar a write_record — igual que un ROLLBACK en un SGBD.
+
+        Retorna lista de (page_id, slot_idx) para cada fragmento.
+        Lanza OverflowError("Disco lleno") si no hay espacio suficiente.
         """
-        current_free = self._current_page().free_space
-        remaining_pages = self.config.total_sectors - self._next_pid - 1
-        
-        max_payload_per_page = self.config.usable_bytes - SLOT_SIZE
-        total_available_bytes = current_free + (remaining_pages * max_payload_per_page)
-
-        if len(data) > total_available_bytes:
-            raise OverflowError(
-                f"Disco lleno: se requieren {len(data)}B pero "
-                f"solo quedan {total_available_bytes}B disponibles."
-            )
-
         fragments: list[tuple[int, int]] = []
+        # Snapshot del estado del disco para rollback si falla
+        pid_snapshot      = self._current_pid
+        next_pid_snapshot = self._next_pid
         pos = 0
 
-        while pos < len(data):
-            page = self._current_page()
-
-            # ¿cabe algo en la página actual?
-            avail = page.free_space
-            
-            if avail <= 0:
-                # abrir nueva página y encadenar
-                new_pid = self._allocate_page()
-                page.next_page = new_pid
-                self._current_pid = new_pid
+        try:
+            while pos < len(data):
                 page = self._current_page()
+
+                # ¿cabe algo en la página actual?
                 avail = page.free_space
+                if avail <= 0:
+                    # abrir nueva página y encadenar
+                    new_pid = self._allocate_page()   # puede lanzar OverflowError
+                    page.next_page = new_pid
+                    self._current_pid = new_pid
+                    page = self._current_page()
+                    avail = page.free_space
 
-            chunk     = data[pos:pos + avail]
-            slot_idx  = page.insert(chunk)
-            
-            if slot_idx is None:
-                raise RuntimeError("Error de coherencia de espacio en SlottedPage.")
+                chunk    = data[pos:pos + avail]
+                slot_idx = page.insert(chunk)
+                if slot_idx is None:
+                    raise RuntimeError(
+                        f"Error interno: página {self._current_pid} reportó "
+                        f"{avail}B libres pero insert() falló. "
+                        f"Posible corrupción de página."
+                    )
 
-            fragments.append((self._current_pid, slot_idx))
-            pos += len(chunk)
+                fragments.append((self._current_pid, slot_idx))
+                pos += len(chunk)
+
+        except OverflowError:
+            # ── ROLLBACK ─────────────────────────────────────────────────────
+            # Eliminar fragmentos parciales ya escritos en páginas existentes
+            for frag_pid, frag_slot in fragments:
+                page = self._pages.get(frag_pid)
+                if page is not None:
+                    page.delete(frag_slot)
+            # Desalojar páginas nuevas creadas durante este write (si las hubo)
+            for pid_to_remove in range(next_pid_snapshot, self._next_pid):
+                self._pages.pop(pid_to_remove, None)
+            # Restaurar punteros de estado
+            self._current_pid = pid_snapshot
+            self._next_pid    = next_pid_snapshot
+            # Quitar next_page del encadenamiento si se había parcheado
+            if pid_snapshot in self._pages:
+                self._pages[pid_snapshot].next_page = None
+            raise   # re-lanzar OverflowError al llamador
 
         return fragments
 
@@ -383,21 +432,39 @@ class AVLNode:
         self.height = 1
 
 
+class DuplicateKeyError(Exception):
+    """
+    Lanzada por AVL(unique=True) cuando se intenta insertar
+    una clave que ya existe en el índice.
+    Equivalente a la violación de restricción PRIMARY KEY / UNIQUE
+    en un SGBD profesional (PostgreSQL: 'duplicate key value
+    violates unique constraint').
+    """
+
+
 class AVL:
     """
     AVL Tree genérico auto-balanceado.
     Soporta claves comparables (int, float, str).
-    Cada nodo acumula una lista de values por clave
-    (útil para índices secundarios con valores repetidos).
+
+    unique=True  → índice primario / UNIQUE:
+                   cada clave mapea exactamente a UN valor.
+                   Insertar una clave duplicada lanza DuplicateKeyError.
+                   Comportamiento idéntico al B-Tree primario de PostgreSQL/MySQL.
+
+    unique=False → índice secundario (no-único):
+                   cada clave acumula una lista de valores (PKs).
+                   Múltiples filas pueden compartir el mismo valor de columna.
 
     insert(key, value)        O(log n)
     search(key)               O(log n) → list[value] | []
     range_search(lo, hi)      O(log n + k) → list[(key, values)]
     """
 
-    def __init__(self):
-        self.root: Optional[AVLNode] = None
-        self.size: int = 0
+    def __init__(self, unique: bool = False):
+        self.root:   Optional[AVLNode] = None
+        self.size:   int  = 0
+        self.unique: bool = unique
 
     def _h(self, n) -> int:
         return n.height if n else 0
@@ -431,14 +498,23 @@ class AVL:
 
     def _insert(self, node, key, value) -> tuple:
         """
-        Retorna (node, created) donde created=True si se creó un nodo nuevo.
+        Retorna (node, created).
+        - unique=True  : clave duplicada → lanza DuplicateKeyError (no modifica el árbol)
+        - unique=False : clave duplicada → acumula value en la lista del nodo existente
         """
         if node is None:
             return AVLNode(key, value), True
         if key == node.key:
+            if self.unique:
+                # Violación de restricción PRIMARY KEY / UNIQUE
+                raise DuplicateKeyError(
+                    f"ERROR: violación de restricción de unicidad — "
+                    f"la clave duplicada '{key}' viola la restricción PRIMARY KEY"
+                )
+            # Índice secundario: acumular PKs distintas
             if value not in node.values:
                 node.values.append(value)
-            return node, False   # nodo ya existía, solo agregamos valor
+            return node, False
         if key < node.key:
             node.left,  created = self._insert(node.left,  key, value)
         else:
@@ -1215,17 +1291,33 @@ class DatabaseManager:
                             f"automática '{pk_val}'."
                         )
 
-                # PK duplicada → omitir
+                # Verificar unicidad de PK antes de almacenar.
+                # Equivalente al check de restricción PRIMARY KEY en un SGBD:
+                # PostgreSQL: "ERROR: duplicate key value violates unique constraint"
                 if pk_val in self._records:
                     dup_pks += 1
                     if dup_pks <= 5:
                         warnings.append(
-                            f"Fila {line_num}: PK duplicada '{pk_val}' — omitida."
+                            f"Fila {line_num}: ERROR — violación de restricción "
+                            f"PRIMARY KEY: la clave duplicada '{pk_val}' ya existe "
+                            f"— INSERT rechazado."
                         )
                     continue
 
                 self._store(casted)
                 self.records_loaded += 1
+
+            except OverflowError:
+                # ── DISCO LLENO: parar la carga inmediatamente ────────────────
+                # Comportamiento SGBD profesional: si el medio de almacenamiento
+                # está lleno no tiene sentido intentar insertar más filas.
+                # El write_record ya hizo rollback del registro parcial.
+                warnings.append(
+                    f"Fila {line_num}: DISCO LLENO — carga interrumpida. "
+                    f"Se cargaron {self.records_loaded} registro(s) correctamente "
+                    f"antes de agotar el espacio disponible."
+                )
+                break   # salir del loop de filas
 
             except Exception as exc:
                 err_rows += 1
@@ -1236,7 +1328,7 @@ class DatabaseManager:
 
         # Resumen final si hubo muchos errores/duplicados
         if dup_pks > 5:
-            warnings.append(f"… y {dup_pks - 5} PK(s) duplicada(s) más omitidas.")
+            warnings.append(f"… y {dup_pks - 5} violación(es) de PRIMARY KEY más — INSERT rechazado.")
         if err_rows > 5:
             warnings.append(f"… y {err_rows - 5} fila(s) con error más omitidas.")
 
@@ -1271,24 +1363,27 @@ class DatabaseManager:
         Construye el AVL de la columna `col` si no existe todavía.
         Si ya existe lo retorna directamente sin reconstruir (lazy indexing).
 
-        Los valores se toman directamente de meta["record"], que ya fue
-        casteado correctamente por el schema en load_csv → cast_row.
-        No se usa _coerce aquí para evitar discrepancias de tipo:
-        ej. "05001" (VARCHAR) no debe convertirse a 5001 (int).
+        Índice primario (col == pk_col) → AVL(unique=True)
+            Un nodo por clave, sin duplicados. Idéntico al B-Tree primario
+            de PostgreSQL/MySQL: una clave → un puntero a fragments en disco.
+
+        Índice secundario (col != pk_col) → AVL(unique=False)
+            Un nodo por valor distinto, cada nodo acumula lista de PKs.
+            Equivalente a un índice no-único (CREATE INDEX sin UNIQUE).
         """
         if col in self.indices:
             return self.indices[col]
 
         pk_col = self.schema.pk_column
-        avl    = AVL()
+        is_pk  = (col == pk_col)
+        avl    = AVL(unique=is_pk)
 
         for pk_val, meta in self._records.items():
-            if col == pk_col:
-                # índice primario: key = pk_val (ya casteado), value = fragments
+            if is_pk:
+                # Primario: key=pk_val → value=fragments (un único valor por clave)
                 avl.insert(pk_val, meta["fragments"])
             else:
-                # índice secundario: tomar valor ya casteado del record
-                # NO usar _coerce — el tipo ya es correcto según el schema
+                # Secundario: key=valor_columna → value=pk (acumula PKs)
                 attr_val = meta["record"].get(col, "")
                 avl.insert(attr_val, pk_val)
 
