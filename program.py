@@ -1,59 +1,16 @@
-"""
-Simulación de Almacenamiento Físico de Base de Datos
-CustomTkinter · Windows 11 · Python 3.12
-
-Modelo: SLOTTED PAGES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Cada sector es una "página" compartida. Varios registros
-(o fragmentos de registros) pueden convivir en la misma
-página. No hay padding desperdiciado al final de un registro
-porque el espacio libre queda disponible para el siguiente.
-
-Formato de página (sector):
-┌──────────────────────────────────────────────────────┐
-│ PAGE HEADER  (fijo, PAGE_HDR bytes)                  │
-│   next_page : int32  página siguiente encadenada (-1)│
-│   free_ptr  : int16  offset del inicio del espacio   │
-│                      libre (crece →)                 │
-│   slot_count: int16  número de slots usados          │
-├──────────────────────────────────────────────────────┤
-│ SLOT DIRECTORY  (crece desde el final ←)             │
-│   slot[n-1]: (offset int16, length int16)  4 bytes   │
-│   slot[n-2]: ...                                     │
-│   ...                                                │
-├──────────────────────────────────────────────────────┤
-│ ESPACIO LIBRE  (entre datos y slot directory)        │
-├──────────────────────────────────────────────────────┤
-│ DATOS  (crecen desde el inicio →)                    │
-│   fragmento del registro en slot[0]                  │
-│   fragmento del registro en slot[1]                  │
-│   ...                                                │
-└──────────────────────────────────────────────────────┘
-
-El AVL indexa por PK → lista de (page_id, slot_idx).
-Un registro grande se fragmenta en varios slots
-(posiblemente en varias páginas), todos encadenados.
-"""
-
 import csv
 import io
-import json
 import re
 import struct
 import tkinter as tk
 from tkinter import filedialog, messagebox
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import customtkinter as ctk
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  COLORES  (constantes — sin concatenaciones en runtime)
-# ══════════════════════════════════════════════════════════════════════════════
 
 BG        = "#0b1120"
 PANEL     = "#111c2e"
@@ -88,25 +45,13 @@ FT  = ("Consolas", 10, "bold")
 FL  = ("Consolas",  9)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  CONSTANTES DE PÁGINA
-# ══════════════════════════════════════════════════════════════════════════════
+PAGE_HDR_FMT  = ">iHH"
+PAGE_HDR_SIZE = struct.calcsize(PAGE_HDR_FMT)
 
-# PAGE HEADER: next_page(int32) + free_ptr(int16) + slot_count(int16)
-PAGE_HDR_FMT  = ">iHH"        # 4 + 2 + 2 = 8 bytes
-PAGE_HDR_SIZE = struct.calcsize(PAGE_HDR_FMT)   # 8
-
-# SLOT ENTRY: offset(int16) + length(int16)
 SLOT_FMT  = ">HH"
-SLOT_SIZE = struct.calcsize(SLOT_FMT)   # 4
+SLOT_SIZE = struct.calcsize(SLOT_FMT)
 
-# Marcador de página vacía / sin encadenamiento
 NO_PAGE = -1
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  GEOMETRÍA DEL DISCO
-# ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class DiskConfig:
@@ -124,18 +69,8 @@ class DiskConfig:
         return self.surfaces * self.tracks_per_surface * self.sectors_per_track
 
     @property
-    def total_bytes(self):
-        return self.total_sectors * self.sector_size_bytes
-
-    @property
     def usable_bytes(self):
-        """Bytes disponibles para datos + slot directory en cada página."""
         return self.sector_size_bytes - PAGE_HDR_SIZE
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  DIRECCIÓN FÍSICA
-# ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class DiskAddress:
@@ -148,45 +83,22 @@ class DiskAddress:
         return (f"Plato {self.platter} | Sup {self.surface} | "
                 f"Pista {self.track:03d} | Sector {self.sector:03d}")
 
-    def to_dict(self):
-        return asdict(self)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SLOTTED PAGE
-# ══════════════════════════════════════════════════════════════════════════════
-
 class SlottedPage:
-    """
-    Página (sector) con slot directory.
-
-    Memoria interna  →  bytearray de sector_size_bytes:
-      [PAGE_HDR | datos→ ... espacio libre ... ←slot_dir]
-
-    free_ptr  apunta al primer byte libre tras los datos.
-    El slot directory crece desde el final hacia el inicio.
-    Hay espacio libre mientras:
-        free_ptr + slot_size_nueva_entrada <= sector_size - slot_count*SLOT_SIZE
-    """
 
     def __init__(self, page_size: int):
         self.page_size  = page_size
         self.data       = bytearray(page_size)
         self.next_page  = NO_PAGE
-        self.free_ptr   = PAGE_HDR_SIZE   # justo tras el header
-        self.slots:     list[tuple[int,int]] = []   # (offset, length)
-
-    # ── espacio disponible ────────────────────────────────────────────────────
+        self.free_ptr   = PAGE_HDR_SIZE
+        self.slots:     list[tuple[int,int]] = []
 
     @property
     def free_space(self) -> int:
-        """Bytes libres reales (espacio para datos + un slot nuevo)."""
         slot_dir_start = self.page_size - len(self.slots) * SLOT_SIZE
         return max(0, slot_dir_start - self.free_ptr - SLOT_SIZE)
 
     @property
     def occupancy_pct(self) -> float:
-        # datos escritos + espacio que ocupa el slot directory
         used = (self.free_ptr - PAGE_HDR_SIZE) + len(self.slots) * SLOT_SIZE
         cap  = self.page_size - PAGE_HDR_SIZE
         return round(min(used / cap * 100, 100.0), 1) if cap > 0 else 0.0
@@ -195,13 +107,7 @@ class SlottedPage:
     def slot_count(self) -> int:
         return len(self.slots)
 
-    # ── insertar fragmento ────────────────────────────────────────────────────
-
     def insert(self, fragment: bytes) -> Optional[int]:
-        """
-        Inserta `fragment` en la página si hay espacio.
-        Retorna el slot_idx asignado, o None si no cabe.
-        """
         if len(fragment) > self.free_space:
             return None
         offset = self.free_ptr
@@ -210,34 +116,18 @@ class SlottedPage:
         self.slots.append((offset, len(fragment)))
         return len(self.slots) - 1
 
-    # ── eliminar fragmento (para rollback) ───────────────────────────────────
-
     def delete(self, slot_idx: int) -> bool:
-        """
-        Libera el slot `slot_idx` para rollback de escrituras parciales.
-
-        Si es el último slot (caso típico de rollback atómico), retrocede
-        free_ptr y elimina el slot → recupera espacio real.
-        Si está en medio, lo marca con length=0 (espacio no recuperable
-        sin compactación — análogo a un DELETE en página fragmentada).
-
-        Retorna True si se liberó espacio real, False si solo se marcó.
-        """
         if slot_idx >= len(self.slots):
             return False
         offset, length = self.slots[slot_idx]
         if slot_idx == len(self.slots) - 1:
-            # Último slot: retroceder el puntero y eliminar el slot
             self.free_ptr = offset
             self.slots.pop()
             self.data[offset:offset + length] = bytes(length)
             return True
         else:
-            # Slot en medio: marcar como eliminado (length=0)
             self.slots[slot_idx] = (offset, 0)
             return False
-
-    # ── leer fragmento ────────────────────────────────────────────────────────
 
     def read(self, slot_idx: int) -> bytes:
         if slot_idx >= len(self.slots):
@@ -245,49 +135,14 @@ class SlottedPage:
         offset, length = self.slots[slot_idx]
         return bytes(self.data[offset:offset + length])
 
-    # ── serialización (para mostrar en popup) ────────────────────────────────
-
-    def to_bytes(self) -> bytes:
-        hdr = struct.pack(PAGE_HDR_FMT,
-                          self.next_page, self.free_ptr, len(self.slots))
-        out = bytearray(self.page_size)
-        out[:PAGE_HDR_SIZE] = hdr
-        # datos
-        out[PAGE_HDR_SIZE:self.free_ptr] = \
-            self.data[PAGE_HDR_SIZE:self.free_ptr]
-        # slot directory (al final)
-        for i, (off, ln) in enumerate(self.slots):
-            pos = self.page_size - (i + 1) * SLOT_SIZE
-            out[pos:pos + SLOT_SIZE] = struct.pack(SLOT_FMT, off, ln)
-        return bytes(out)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  DISCO SIMULADO
-# ══════════════════════════════════════════════════════════════════════════════
-
 class Disk:
-    """
-    Disco con slotted pages.
-
-    write_record(data) → list[(page_id, slot_idx)]
-        Intenta llenar la página actual antes de abrir una nueva.
-        Si un fragmento no cabe en la página actual, abre una nueva
-        y encadena via next_page.
-        Retorna la lista de (page_id, slot_idx) de cada fragmento.
-
-    read_record(fragments) → bytes
-        Dado [(page_id, slot_idx), ...] reconstruye el registro completo.
-    """
 
     def __init__(self, config: DiskConfig):
         self.config       = config
         self._pages:      dict[int, SlottedPage] = {}
-        self._current_pid = 0          # página abierta actualmente
-        self._next_pid    = 0          # próximo page_id a asignar
-        self._allocate_page()          # crear primera página
-
-    # ── gestión de páginas ────────────────────────────────────────────────────
+        self._current_pid = 0
+        self._next_pid    = 0
+        self._allocate_page()
 
     def _allocate_page(self) -> int:
         if self._next_pid >= self.config.total_sectors:
@@ -299,8 +154,6 @@ class Disk:
 
     def _current_page(self) -> SlottedPage:
         return self._pages[self._current_pid]
-
-    # ── conversiones lineal ↔ dirección ──────────────────────────────────────
 
     def linear_to_address(self, pid: int) -> DiskAddress:
         c   = self.config
@@ -316,26 +169,8 @@ class Disk:
         tg = sg * c.tracks_per_surface + a.track
         return tg * c.sectors_per_track + a.sector
 
-    # ── escritura ─────────────────────────────────────────────────────────────
-
     def write_record(self, data: bytes) -> list[tuple[int, int]]:
-        """
-        Escribe `data` distribuyéndola en slots de páginas.
-        Un registro grande se reparte en varios fragmentos.
-        El espacio libre de una página se aprovecha al máximo
-        antes de abrir una nueva → cero padding desperdiciado.
-
-        ATOMICIDAD (comportamiento SGBD profesional):
-          Si el disco se llena a mitad de escritura, se hace rollback
-          de todos los fragmentos parciales ya escritos antes de lanzar
-          OverflowError. El disco queda en el mismo estado que antes
-          de llamar a write_record — igual que un ROLLBACK en un SGBD.
-
-        Retorna lista de (page_id, slot_idx) para cada fragmento.
-        Lanza OverflowError("Disco lleno") si no hay espacio suficiente.
-        """
         fragments: list[tuple[int, int]] = []
-        # Snapshot del estado del disco para rollback si falla
         pid_snapshot      = self._current_pid
         next_pid_snapshot = self._next_pid
         pos = 0
@@ -344,11 +179,9 @@ class Disk:
             while pos < len(data):
                 page = self._current_page()
 
-                # ¿cabe algo en la página actual?
                 avail = page.free_space
                 if avail <= 0:
-                    # abrir nueva página y encadenar
-                    new_pid = self._allocate_page()   # puede lanzar OverflowError
+                    new_pid = self._allocate_page()
                     page.next_page = new_pid
                     self._current_pid = new_pid
                     page = self._current_page()
@@ -367,34 +200,21 @@ class Disk:
                 pos += len(chunk)
 
         except OverflowError:
-            # ── ROLLBACK ─────────────────────────────────────────────────────
-            # Eliminar fragmentos parciales ya escritos en páginas existentes
             for frag_pid, frag_slot in fragments:
                 page = self._pages.get(frag_pid)
                 if page is not None:
                     page.delete(frag_slot)
-            # Desalojar páginas nuevas creadas durante este write (si las hubo)
             for pid_to_remove in range(next_pid_snapshot, self._next_pid):
                 self._pages.pop(pid_to_remove, None)
-            # Restaurar punteros de estado
             self._current_pid = pid_snapshot
             self._next_pid    = next_pid_snapshot
-            # Quitar next_page del encadenamiento si se había parcheado
             if pid_snapshot in self._pages:
                 self._pages[pid_snapshot].next_page = NO_PAGE
-            raise   # re-lanzar OverflowError al llamador
+            raise
 
         return fragments
 
-    # ── lectura ───────────────────────────────────────────────────────────────
-
     def read_record(self, fragments: list[tuple[int, int]]) -> bytes:
-        """
-        Reconstruye el registro leyendo cada (page_id, slot_idx).
-        Lanza RuntimeError si algún fragmento referencia una página
-        inexistente — señal de corrupción de datos, igual que un
-        SGBD que detecta un bloque marcado como usado pero no asignado.
-        """
         parts = []
         for pid, slot_idx in fragments:
             page = self._pages.get(pid)
@@ -413,26 +233,7 @@ class Disk:
     def pages_used(self) -> int:
         return self._next_pid
 
-    def flush(self):
-        """No-op: todo está en RAM, no hay archivo que sincronizar."""
-        pass
-
-    def close(self):
-        """No-op: no hay archivo abierto que cerrar."""
-        pass
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  AVL TREE  (índice por PK)
-# ══════════════════════════════════════════════════════════════════════════════
-
 class AVLNode:
-    """
-    Nodo genérico del AVL.
-    values almacena:
-      - En el árbol PRIMARIO (PK):     [(page_id, slot_idx), ...]
-      - En los árboles SECUNDARIOS:    [pk1, pk2, ...]  (lista de PKs)
-    """
     __slots__ = ("key", "values", "left", "right", "height")
 
     def __init__(self, key, value):
@@ -442,35 +243,13 @@ class AVLNode:
         self.right  = None
         self.height = 1
 
-
 class DuplicateKeyError(Exception):
-    """
-    Lanzada por AVL(unique=True) cuando se intenta insertar
-    una clave que ya existe en el índice.
-    Equivalente a la violación de restricción PRIMARY KEY / UNIQUE
-    en un SGBD profesional (PostgreSQL: 'duplicate key value
-    violates unique constraint').
-    """
+    pass
 
+class TypeViolation(Exception):
+    pass
 
 class AVL:
-    """
-    AVL Tree genérico auto-balanceado.
-    Soporta claves comparables (int, float, str).
-
-    unique=True  → índice primario / UNIQUE:
-                   cada clave mapea exactamente a UN valor.
-                   Insertar una clave duplicada lanza DuplicateKeyError.
-                   Comportamiento idéntico al B-Tree primario de PostgreSQL/MySQL.
-
-    unique=False → índice secundario (no-único):
-                   cada clave acumula una lista de valores (PKs).
-                   Múltiples filas pueden compartir el mismo valor de columna.
-
-    insert(key, value)        O(log n)
-    search(key)               O(log n) → list[value] | []
-    range_search(lo, hi)      O(log n + k) → list[(key, values)]
-    """
 
     def __init__(self, unique: bool = False):
         self.root:   Optional[AVLNode] = None
@@ -508,21 +287,14 @@ class AVL:
         return n
 
     def _insert(self, node, key, value) -> tuple:
-        """
-        Retorna (node, created).
-        - unique=True  : clave duplicada → lanza DuplicateKeyError (no modifica el árbol)
-        - unique=False : clave duplicada → acumula value en la lista del nodo existente
-        """
         if node is None:
             return AVLNode(key, value), True
         if key == node.key:
             if self.unique:
-                # Violación de restricción PRIMARY KEY / UNIQUE
                 raise DuplicateKeyError(
                     f"ERROR: violación de restricción de unicidad — "
                     f"la clave duplicada '{key}' viola la restricción PRIMARY KEY"
                 )
-            # Índice secundario: acumular PKs distintas
             if value not in node.values:
                 node.values.append(value)
             return node, False
@@ -535,7 +307,7 @@ class AVL:
     def insert(self, key, value):
         self.root, created = self._insert(self.root, key, value)
         if created:
-            self.size += 1   # solo cuenta nodos físicos del árbol
+            self.size += 1
 
     def search(self, key) -> list:
         cur = self.root
@@ -568,41 +340,26 @@ class AVL:
         return levels
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  ESQUEMA SQL
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Tokens de texto que representan booleanos en CSVs reales (exports de
-# PostgreSQL, pandas, JSON, etc.). Sin esto, cast() intentaba float("true")
-# y todo terminaba silenciosamente en 0 — incluso los valores verdaderos.
 _BOOL_TRUE_TOKENS:  set[str] = {"true", "t", "sí", "si", "verdadero", "yes", "y"}
 _BOOL_FALSE_TOKENS: set[str] = {"false", "f", "no", "falso", "n"}
 
 
 @dataclass
 class ColumnDef:
-    name:     str
-    sql_type: str
-    is_pk:    bool = False
-    not_null: bool = False
-    py_type:  type = str
+    name:        str
+    sql_type:    str
+    is_pk:       bool = False
+    not_null:    bool = False
+    is_unique:   bool = False
+    py_type:     type = str
+    char_length: int  = 0
 
     def cast(self, v: Any) -> Any:
-        """
-        Castea `v` al tipo de la columna de forma tolerante.
-        - Valores vacíos/None → 0, 0.0 o "" según el tipo (no crashea)
-        - "10.0" en columna INT → 10  (via float intermedio)
-        - "true"/"false" (y variantes en español) en columna INT/BOOLEAN → 1/0
-          (antes se intentaba float("true") y todo terminaba en 0, incluso
-          los valores "true" — bug crítico de corrupción silenciosa, corregido)
-        - Texto no reconocido en columna INT → 0   (valor seguro por defecto)
-        - Tipos desconocidos  → str(v)
-        """
-        # Valor vacío → default seguro según tipo
-        if v is None or (isinstance(v, str) and v.strip() == ""):
+        is_empty = v is None or (isinstance(v, str) and v.strip() == "")
+        if is_empty:
             if self.py_type is int:   return 0
             if self.py_type is float: return 0.0
-            return ""
+            return " " * self.char_length if self.char_length > 0 else ""
 
         if self.py_type is int:
             if isinstance(v, str):
@@ -612,115 +369,108 @@ class ColumnDef:
                 if low in _BOOL_FALSE_TOKENS:
                     return 0
             try:
-                return int(float(v))   # maneja "10.0", "10", 10.0
+                f = float(v)
             except (ValueError, TypeError):
-                return 0               # texto en columna INT → 0
+                raise TypeViolation(
+                    f"el valor '{v}' no es válido para la columna "
+                    f"'{self.name}' (tipo {self.sql_type})"
+                )
+            return int(f)
 
         if self.py_type is float:
             try:
                 return float(v)
             except (ValueError, TypeError):
-                return 0.0
+                raise TypeViolation(
+                    f"el valor '{v}' no es válido para la columna "
+                    f"'{self.name}' (tipo {self.sql_type})"
+                )
 
-        # str y cualquier otro tipo
-        return str(v).strip()
-
+        s = str(v)
+        if self.char_length > 0:
+            return s[:self.char_length].ljust(self.char_length)
+        return s.strip()
 
 @dataclass
 class TableSchema:
     name:    str
     columns: list
+    unique_groups: list = field(default_factory=list)
+
+    @property
+    def pk_columns(self) -> list[str]:
+        pks = [c.name for c in self.columns if c.is_pk]
+        if pks:
+            return pks
+        return [self.columns[0].name] if self.columns else []
+
+    @property
+    def is_composite_pk(self) -> bool:
+        return len(self.pk_columns) > 1
 
     @property
     def pk_column(self) -> Optional[str]:
-        for c in self.columns:
-            if c.is_pk: return c.name
-        return self.columns[0].name if self.columns else None
+        cols = self.pk_columns
+        return cols[0] if cols else None
+
+    @property
+    def pk_label(self) -> str:
+        cols = self.pk_columns
+        if len(cols) > 1:
+            return "(" + ", ".join(cols) + ")"
+        return cols[0] if cols else "—"
+
+    def pk_value(self, row: dict):
+        cols = self.pk_columns
+        if len(cols) > 1:
+            return tuple(row.get(c, "") for c in cols)
+        return row.get(cols[0], "") if cols else None
+
+    def format_pk(self, pk_val) -> str:
+        if isinstance(pk_val, tuple):
+            return "(" + ", ".join(str(v) for v in pk_val) + ")"
+        return str(pk_val)
 
     def cast_row(self, row: dict) -> dict:
         cm = {c.name: c for c in self.columns}
         return {k: cm[k].cast(v) if k in cm else v for k, v in row.items()}
 
 
-# ── Tipos SQL → Python  (cobertura exhaustiva multi-dialecto) ─────────────────
-#
-# MySQL / MariaDB / PostgreSQL / SQLite / SQL Server / Oracle / DB2
-# Regla: si el tipo almacena números enteros → int
-#         si almacena números reales          → float
-#         cualquier otra cosa                 → str  (seguro para comparar y mostrar)
-
 _INT_TYPES: set[str] = {
-    # SQL estándar
     "INT", "INTEGER", "SMALLINT", "BIGINT", "TINYINT",
-    # MySQL / MariaDB
     "MEDIUMINT", "INT1", "INT2", "INT3", "INT4", "INT8",
     "UNSIGNED", "SIGNED",
-    # PostgreSQL (INT2/INT4/INT8 ya cubiertos arriba, mismo set)
     "SERIAL", "SMALLSERIAL", "BIGSERIAL",
     "OID", "XID", "CID",
-    # SQL Server
-    "BIT",                          # 0/1 → int
-    # SQLite
+    "BIT",
     "ROWID",
-    # Oracle
-    "NUMBER",                       # sin decimales → int (ver _sql_to_py)
-    # IBM DB2
-    # NOTA: "DECFLOAT" se maneja como NUMBER (ver _sql_to_py): sin escala → int,
-    # con escala > 0 → float. NO debe estar aquí también, o siempre ganaría int
-    # y truncaría los decimales (bug confirmado y corregido).
-    # Alias comunes
-    "BOOL", "BOOLEAN",              # internamente 0/1
-    "YEAR",                         # MySQL YEAR → entero de 4 dígitos
-    "COUNTER",                      # Access
+    "BOOL", "BOOLEAN",
+    "YEAR",
+    "COUNTER",
 }
 
 _FLOAT_TYPES: set[str] = {
-    # SQL estándar
     "FLOAT", "REAL", "DOUBLE", "NUMERIC", "DECIMAL", "DEC",
-    # MySQL
     "DOUBLE PRECISION", "FIXED",
-    # PostgreSQL
     "FLOAT4", "FLOAT8", "MONEY",
-    # SQL Server
     "SMALLMONEY",
-    # Oracle
     "BINARY_FLOAT", "BINARY_DOUBLE",
-    # IBM DB2
-    "DECFLOAT",
-    # Alias
-    "NUMBER",                       # Oracle NUMBER con decimales → float
-    "CURRENCY",                     # Access
+    "NUMBER", "DECFLOAT",
+    "CURRENCY",
 }
 
-# Todo lo demás → str. No hace falta listarlo: cualquier tipo no reconocido
-# cae en el fallback str, que es seguro para UUID, JSONB, ARRAY, INET, etc.
 
 def _sql_to_py(raw_type: str) -> type:
-    """
-    Convierte tipo SQL a tipo Python. Cobertura exhaustiva multi-dialecto.
-    Tipos desconocidos → str (nunca crashea).
-
-    Reglas especiales:
-    - NUMBER(p,0) o NUMBER(p) sin escala     → int   (Oracle)
-    - NUMBER(p,s) con s>0                    → float (Oracle)
-    - DECFLOAT(p,0) o DECFLOAT(p) sin escala → int   (DB2)
-    - DECFLOAT(p,s) con s>0 / sin parámetros → float (DB2)
-    - DOUBLE PRECISION                       → float (PostgreSQL / SQL estándar)
-    - UNSIGNED / SIGNED                      → int   (MySQL modificador de tipo)
-    """
     raw   = raw_type.strip()
     upper = raw.upper()
 
-    # DOUBLE PRECISION: dos palabras, caso especial
     if re.match(r"DOUBLE\s+PRECISION", upper):
         return float
 
-    # Extraer base y parámetros: DECIMAL(10,2) → base="DECIMAL", params="10,2"
     m = re.match(r"([A-Z_ ]+?)(?:\(([^)]*)\))?$", upper.strip())
     base   = m.group(1).strip() if m else upper
     params = m.group(2)         if m else None
 
-    # Oracle NUMBER / DB2 DECFLOAT: con escala>0 → float, sin escala (o "p,0") → int
     if base in ("NUMBER", "DECFLOAT"):
         if params:
             parts = [p.strip() for p in params.split(",")]
@@ -729,76 +479,90 @@ def _sql_to_py(raw_type: str) -> type:
                     return int if int(parts[1]) == 0 else float
                 except ValueError:
                     pass
-            # (p) sin escala → int
             return int
-        # Sin parámetros → float (más seguro, p.ej. DECFLOAT usado para dinero)
         return float
 
     if base in _INT_TYPES:   return int
     if base in _FLOAT_TYPES: return float
-    return str   # fallback universal: UUID, JSONB, ARRAY, INET, XML, etc.
+    return str
+
+
+_INT_PACK_FMT  = ">i"
+_INT_PACK_SIZE = struct.calcsize(_INT_PACK_FMT)
+_FLT_PACK_FMT  = ">d"
+_FLT_PACK_SIZE = struct.calcsize(_FLT_PACK_FMT)
+_STR_LEN_FMT   = ">H"
+_STR_LEN_SIZE  = struct.calcsize(_STR_LEN_FMT)
+_STR_MAX_BYTES = 65535
+
+
+def _serialize_record(schema: "TableSchema", row: dict) -> bytes:
+    out = bytearray()
+    for col in schema.columns:
+        val = row.get(col.name)
+        if col.py_type is int:
+            ival = 0 if val is None else int(val)
+            ival = max(-2_147_483_648, min(2_147_483_647, ival))
+            out += struct.pack(_INT_PACK_FMT, ival)
+        elif col.py_type is float:
+            fval = 0.0 if val is None else float(val)
+            out += struct.pack(_FLT_PACK_FMT, fval)
+        elif col.char_length > 0:
+            sval  = "" if val is None else str(val)
+            fixed = sval[:col.char_length].ljust(col.char_length)
+            out  += fixed.encode("utf-8")[:col.char_length]
+        else:
+            sval   = "" if val is None else str(val)
+            sbytes = sval.encode("utf-8")[:_STR_MAX_BYTES]
+            out   += struct.pack(_STR_LEN_FMT, len(sbytes))
+            out   += sbytes
+    return bytes(out)
+
+
+def _deserialize_record(schema: "TableSchema", data: bytes) -> dict:
+    pos = 0
+    row = {}
+    for col in schema.columns:
+        if col.py_type is int:
+            if pos + _INT_PACK_SIZE > len(data):
+                break
+            (ival,) = struct.unpack_from(_INT_PACK_FMT, data, pos)
+            pos += _INT_PACK_SIZE
+            row[col.name] = ival
+        elif col.py_type is float:
+            if pos + _FLT_PACK_SIZE > len(data):
+                break
+            (fval,) = struct.unpack_from(_FLT_PACK_FMT, data, pos)
+            pos += _FLT_PACK_SIZE
+            row[col.name] = fval
+        elif col.char_length > 0:
+            n = col.char_length
+            if pos + n > len(data):
+                break
+            row[col.name] = data[pos:pos + n].decode("utf-8", errors="replace")
+            pos += n
+        else:
+            if pos + _STR_LEN_SIZE > len(data):
+                break
+            (slen,) = struct.unpack_from(_STR_LEN_FMT, data, pos)
+            pos += _STR_LEN_SIZE
+            if pos + slen > len(data):
+                break
+            row[col.name] = data[pos:pos + slen].decode("utf-8", errors="replace")
+            pos += slen
+    return row
 
 
 def parse_schema(text: str) -> TableSchema:
-    """
-    Parser CREATE TABLE de nivel profesional. Soporta:
-
-    DIALECTOS:
-      MySQL / MariaDB, PostgreSQL, SQLite, SQL Server (T-SQL),
-      Oracle, IBM DB2, Access — en un único parser.
-
-    SINTAXIS SOPORTADA:
-      ✓ CREATE TABLE / CREATE TABLE IF NOT EXISTS
-      ✓ CREATE TEMPORARY TABLE / CREATE TEMP TABLE
-      ✓ Nombres con backticks `t`, comillas dobles "t", corchetes [t] (T-SQL),
-        comillas simples 't', sin comillas
-      ✓ Esquema calificado: schema.tabla, `db`.`tabla`, [dbo].[tabla]
-      ✓ Tipos con precisión: VARCHAR(255), DECIMAL(10,2), NUMERIC(18,4)
-      ✓ Tipos de dos palabras: DOUBLE PRECISION, CHARACTER VARYING,
-        BINARY VARYING, NATIONAL CHAR, LONG RAW, etc.
-      ✓ PRIMARY KEY inline y separado
-      ✓ PKs compuestas: PRIMARY KEY (col_a, col_b) → usa col_a como PK
-        y avisa sobre col_b
-      ✓ CONSTRAINT nombre PRIMARY KEY (...)
-      ✓ FOREIGN KEY, UNIQUE, CHECK, INDEX, KEY — ignorados silenciosamente
-      ✓ NOT NULL, NULL, AUTO_INCREMENT, AUTOINCREMENT, IDENTITY(1,1),
-        GENERATED ALWAYS AS IDENTITY, DEFAULT <valor>, DEFAULT (<expr>),
-        UNIQUE inline, UNSIGNED, ZEROFILL, CHARACTER SET, COLLATE,
-        ON UPDATE, COMMENT, REFERENCES, CHECK (<expr>)
-      ✓ Comentarios -- y /* ... */ (incluso multilínea)
-      ✓ Sin PK definida → primera columna como PK (fallback seguro)
-      ✓ Columnas sin tipo → VARCHAR fallback
-
-    RETORNA: TableSchema con pk_column = primera PK detectada (o col[0])
-    LANZA:   ValueError solo si no hay columnas en absoluto
-
-    LIMITACIÓN CONOCIDA: una columna sin comillas llamada exactamente `key`
-    o `index` se interpreta como el inicio de una restricción de tabla
-    (igual que lo haría cualquier motor SQL real, donde esas son palabras
-    reservadas). Si necesitan una columna con ese nombre, escríbanla entre
-    comillas/backticks: `key`, "index".
-    """
-
-    # ── 0. Normalizar saltos de línea ─────────────────────────────────────
     text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    # ── 1. Eliminar comentarios ───────────────────────────────────────────
-    # /* ... */ multilínea
     clean = re.sub(r'/\*.*?\*/', ' ', text, flags=re.DOTALL)
-    # -- hasta fin de línea
     clean = re.sub(r'--[^\n]*', ' ', clean)
-    # # hasta fin de línea (MySQL shell, algunos dumps)
     clean = re.sub(r'#[^\n]*',  ' ', clean)
-    # Normalizar espacios
     clean = " ".join(clean.split())
 
-    # ── 2. Extraer nombre de tabla ────────────────────────────────────────
-    # Soporta: CREATE [TEMPORARY|TEMP] TABLE [IF NOT EXISTS]
-    #   nombre simple, schema.tabla, db.schema.tabla
-    #   con cualquier combinación de ` " [ ] ' o sin comillas
-    _QI = r'(?:[`"\[]?)(\w+)(?:[`"\]]?)'   # identificador opcionalmente entre comillas
-    # prefijo opcional: uno o dos niveles de schema (db.schema. o schema.)
-    _PREFIX = rf'(?:{_QI}\.)*'             # cero o más niveles de prefijo
+    _QI = r'(?:[`"\[]?)(\w+)(?:[`"\]]?)'
+    _PREFIX = rf'(?:{_QI}\.)*'
 
     tbl_pat = re.compile(
         r"CREATE\s+(?:TEMPORARY\s+|TEMP\s+)?TABLE\s+"
@@ -819,10 +583,8 @@ def parse_schema(text: str) -> TableSchema:
             "  CREATE TABLE `nombre` (...)   -- backticks\n"
             "  CREATE TABLE [dbo].[nombre] (...) -- T-SQL"
         )
-    # El último grupo capturado es el nombre de la tabla (sin schema)
     name = m.group(m.lastindex)
 
-    # ── 3. Extraer cuerpo (contador de paréntesis, ignora strings) ────────
     start = clean.index("(", m.start()) + 1
     depth = 1
     i = start
@@ -841,12 +603,9 @@ def parse_schema(text: str) -> TableSchema:
         i += 1
     body = clean[start:i - 1].strip()
 
-    # ── 4. Split de cláusulas respetando paréntesis Y strings ────────────
-    # Problema sin este fix: DEFAULT 'hola,mundo' se parte en la coma
-    # Solución: rastrear si estamos dentro de '' o "" además de ()
     parts: list[str] = []
     depth    = 0
-    in_str   = None   # None | "'" | '"'
+    in_str   = None
     buf      = []
     i_body   = 0
     while i_body < len(body):
@@ -854,7 +613,6 @@ def parse_schema(text: str) -> TableSchema:
         if in_str:
             buf.append(ch)
             if ch == in_str:
-                # ¿escape de comilla duplicada? ('it''s' en SQL)
                 if i_body + 1 < len(body) and body[i_body + 1] == in_str:
                     buf.append(body[i_body + 1])
                     i_body += 1
@@ -875,7 +633,6 @@ def parse_schema(text: str) -> TableSchema:
     if buf:
         parts.append("".join(buf).strip())
 
-    # ── 5. Palabras clave de restricciones de tabla (no son columnas) ─────
     _TABLE_CONSTRAINTS = re.compile(
         r"^(?:PRIMARY\s+KEY|FOREIGN\s+KEY|UNIQUE\s+(?:KEY|INDEX)?|"
         r"UNIQUE$|CHECK\s*\(|CONSTRAINT\s+(?:\w|[`\"\[\'])|INDEX\s+|KEY\s+|"
@@ -883,7 +640,6 @@ def parse_schema(text: str) -> TableSchema:
         re.IGNORECASE
     )
 
-    # ── 6. Modificadores inline a ignorar ─────────────────────────────────
     _INLINE_STRIP = re.compile(
         r"\b(?:"
         r"NOT\s+NULL|NULL|AUTO_INCREMENT|AUTOINCREMENT|"
@@ -898,13 +654,12 @@ def parse_schema(text: str) -> TableSchema:
         r"CHECK\s*\([^)]*\)|"
         r"ENABLE|DISABLE|NOCHECK|WITH\s+(?:CHECK|NOCHECK)|"
         r"SPARSE|ROWGUIDCOL|FILESTREAM|"
-        r"VISIBLE|INVISIBLE|"                  # MySQL 8
-        r"PRIMARY\s+KEY"                       # inline PK — detectada antes de strip
+        r"VISIBLE|INVISIBLE|"
+        r"PRIMARY\s+KEY"
         r")\b",
         re.IGNORECASE
     )
 
-    # ── 7. Tipos de dos (o más) palabras ──────────────────────────────────
     _TWO_WORD_TYPES = re.compile(
         r"^(?:"
         r"DOUBLE\s+PRECISION|CHARACTER\s+VARYING|BINARY\s+VARYING|"
@@ -919,9 +674,10 @@ def parse_schema(text: str) -> TableSchema:
         re.IGNORECASE
     )
 
-    cols:       list[ColumnDef] = []
-    pk_columns: list[str]       = []
-    pk_warnings: list[str]      = []
+    cols:           list[ColumnDef] = []
+    pk_columns:     list[str]       = []
+    pk_warnings:    list[str]       = []
+    unique_groups:  list[list[str]] = []
 
     for part in parts:
         part = part.strip()
@@ -930,9 +686,7 @@ def parse_schema(text: str) -> TableSchema:
 
         upper_part = part.upper().lstrip()
 
-        # ── 7a. ¿Restricción de tabla? ────────────────────────────────────
         if _TABLE_CONSTRAINTS.match(upper_part):
-            # Capturar PK compuesta: PRIMARY KEY (col_a, col_b, ...)
             pk_m = re.search(
                 r"PRIMARY\s+KEY\s*\(([^)]+)\)", part, re.IGNORECASE)
             if pk_m:
@@ -943,15 +697,22 @@ def parse_schema(text: str) -> TableSchema:
                 pk_columns.extend(found_pks)
                 if len(found_pks) > 1:
                     pk_warnings.append(
-                        f"PK compuesta detectada {found_pks} — "
-                        f"se usará '{found_pks[0]}' como clave primaria. "
-                        f"Las demás columnas ({', '.join(found_pks[1:])}) "
-                        f"se indexan normalmente."
+                        f"PK compuesta detectada {found_pks} — se usará la "
+                        f"combinación de estas {len(found_pks)} columnas "
+                        f"como clave primaria única (no solo la primera)."
                     )
+            else:
+                uniq_m = re.search(
+                    r"UNIQUE\s*(?:KEY\s+\S+\s*|INDEX\s+\S+\s*)?\(([^)]+)\)",
+                    part, re.IGNORECASE)
+                if uniq_m:
+                    found_uniq = [
+                        k.strip().strip("`\"[]'")
+                        for k in uniq_m.group(1).split(",")
+                    ]
+                    unique_groups.append(found_uniq)
             continue
 
-        # ── 7b. Extraer nombre de columna ─────────────────────────────────
-        # Soporta: `nombre`, "nombre", [nombre], 'nombre', nombre
         cname_m = re.match(
             r"^(?:`([^`]+)`|\"([^\"]+)\"|"
             r"\[([^\]]+)\]|'([^']+)'|(\w+))",
@@ -963,35 +724,28 @@ def parse_schema(text: str) -> TableSchema:
         rest  = part[cname_m.end():].strip()
 
         if not rest:
-            # Columna sin tipo (SQLite lo permite) → VARCHAR, posible PK inline
             cols.append(ColumnDef(
                 name=cname, sql_type="VARCHAR",
                 py_type=str, is_pk=False, not_null=False
             ))
             continue
 
-        # ── 7c. ¿PK inline? ───────────────────────────────────────────────
         is_pk = bool(re.search(r"\bPRIMARY\s+KEY\b", rest, re.IGNORECASE))
         if is_pk:
             pk_columns.append(cname)
 
-        # ── 7d. Extraer tipo ──────────────────────────────────────────────
-        # Quitar PRIMARY KEY del inicio de rest antes de extraer tipo,
-        # luego quitar todos los modificadores inline (NOT NULL, DEFAULT,
-        # AUTO_INCREMENT, UNSIGNED, REFERENCES, etc.) con _INLINE_STRIP,
-        # de modo que solo quede el tipo base con su precisión opcional.
+        is_unique_inline = (not is_pk) and bool(
+            re.search(r"\bUNIQUE\b", rest, re.IGNORECASE))
+
         rest_for_type = re.sub(r"^PRIMARY\s+KEY\s*", "", rest.strip(), flags=re.IGNORECASE).strip()
         rest_for_type = _INLINE_STRIP.sub(" ", rest_for_type).strip()
         if not rest_for_type:
-            # Solo tenía PRIMARY KEY / modificadores sin tipo → VARCHAR (SQLite)
             raw_type = "VARCHAR"
         else:
-            # Primero intentar tipo de dos palabras
             two = _TWO_WORD_TYPES.match(rest_for_type)
             if two:
                 raw_type = two.group(0).strip()
             else:
-                # Tipo simple: primera palabra con paréntesis opcional
                 type_m = re.match(
                     r"([`\w]+(?:\s*\([^)]*\))?)",
                     rest_for_type
@@ -999,32 +753,41 @@ def parse_schema(text: str) -> TableSchema:
                 raw_type = (type_m.group(1).strip().strip("`")
                             if type_m else "VARCHAR")
 
-        # Limpiar espacios residuales del tipo
         raw_type_clean = re.sub(r'\s+', ' ', raw_type).strip()
 
-        # ── 7e. ¿NOT NULL? ────────────────────────────────────────────────
         not_null = is_pk or bool(
             re.search(r"\bNOT\s+NULL\b", rest, re.IGNORECASE))
 
         cols.append(ColumnDef(
-            name     = cname,
-            sql_type = raw_type_clean,
-            is_pk    = is_pk,
-            not_null = not_null,
-            py_type  = _sql_to_py(raw_type_clean),
+            name      = cname,
+            sql_type  = raw_type_clean,
+            is_pk     = is_pk,
+            not_null  = not_null,
+            is_unique = is_unique_inline,
+            py_type   = _sql_to_py(raw_type_clean),
         ))
 
-    # ── 8. Marcar PKs detectadas en restricciones de tabla ────────────────
     pk_set = set(pk_columns)
     for c in cols:
         if c.name in pk_set:
             c.is_pk    = True
             c.not_null = True
+            c.is_unique = False
 
-    # ── 9. Fallback: sin PK → primera columna ────────────────────────────
     if not any(c.is_pk for c in cols) and cols:
         cols[0].is_pk    = True
         cols[0].not_null = True
+
+    for c in cols:
+        if c.is_unique:
+            unique_groups.append([c.name])
+
+    pk_cols_final = [c.name for c in cols if c.is_pk] or \
+                    ([cols[0].name] if cols else [])
+    unique_groups = [
+        g for g in unique_groups
+        if sorted(g) != sorted(pk_cols_final)
+    ]
 
     if not cols:
         raise ValueError(
@@ -1032,69 +795,33 @@ def parse_schema(text: str) -> TableSchema:
             "Verifica que el archivo sea un CREATE TABLE estándar SQL."
         )
 
-    schema = TableSchema(name, cols)
-    schema._pk_warnings = pk_warnings   # para mostrar en la UI si se desea
+    schema = TableSchema(name, cols, unique_groups=unique_groups)
+    schema._pk_warnings = pk_warnings
     return schema
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  DATABASE MANAGER
-# ══════════════════════════════════════════════════════════════════════════════
 
 class DatabaseManager:
-    """
-    Orquesta Disk (slotted pages) + AVL por demanda + TableSchema.
-
-    Los índices AVL NO se construyen al cargar los datos.
-    Se construyen la primera vez que se busca por esa columna
-    y se reutilizan mientras el programa esté abierto.
-    Si se reinicia, se reconstruyen al buscar de nuevo.
-
-    indices: dict[col_name → AVL]   (vacío al inicio, se llena por demanda)
-    _records[pk] = {
-        "record":    dict,
-        "fragments": [(page_id, slot_idx), ...],
-        "raw_len":   int,
-    }
-    """
 
     def __init__(self, disk: Disk):
         self.disk                    = disk
-        self.indices: dict[str, AVL] = {}   # se llena solo al buscar
+        self.indices: dict[str, AVL] = {}
         self.schema: Optional[TableSchema] = None
         self.records_loaded          = 0
         self._records: dict          = {}
-
-    # ── carga ─────────────────────────────────────────────────────────────────
+        self._unique_seen: dict      = {}
 
     def load_schema(self, path: str) -> list[str]:
-        """
-        Carga el esquema SQL con detección automática de encoding.
-        Retorna lista de advertencias (ej. PKs compuestas).
-        """
         encoding = self._detect_encoding(path)
         with open(path, encoding=encoding, errors="replace") as f:
             self.schema = parse_schema(f.read())
-        # NO se crean AVLs aquí — se crean al momento de buscar
         return getattr(self.schema, "_pk_warnings", [])
-
-    # ── detección automática de encoding ─────────────────────────────────────
 
     @staticmethod
     def _detect_encoding(path: str) -> str:
-        """
-        Detecta el encoding del archivo leyendo los primeros 8 KB.
-        Orden de prioridad:
-          1. BOM explícito (UTF-32, UTF-16, UTF-8-BOM)
-          2. Heurística ASCII-safe: si todo es ASCII puro → utf-8
-          3. Prueba utf-8 estricto
-          4. Prueba encodings latinos comunes (cp1252, latin-1, iso-8859-1)
-          5. Fallback: latin-1 (nunca falla, acepta cualquier byte)
-        """
         with open(path, "rb") as f:
             raw = f.read(8192)
 
-        # BOM
         if raw.startswith(b"\xff\xfe\x00\x00") or raw.startswith(b"\x00\x00\xfe\xff"):
             return "utf-32"
         if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
@@ -1102,14 +829,12 @@ class DatabaseManager:
         if raw.startswith(b"\xef\xbb\xbf"):
             return "utf-8-sig"
 
-        # Intentar utf-8 estricto
         try:
             raw.decode("utf-8")
             return "utf-8"
         except UnicodeDecodeError:
             pass
 
-        # Encodings comunes en español / Europa occidental
         for enc in ("cp1252", "iso-8859-1", "latin-1"):
             try:
                 raw.decode(enc)
@@ -1117,16 +842,10 @@ class DatabaseManager:
             except UnicodeDecodeError:
                 continue
 
-        return "latin-1"   # nunca falla
+        return "latin-1"
 
     @staticmethod
     def _detect_delimiter(path: str, encoding: str) -> str:
-        """
-        Detecta el delimitador del CSV leyendo las primeras 5 líneas.
-        Candidatos: coma, punto y coma, tabulador, pipe, dos puntos.
-        Gana el que aparezca más veces de forma consistente.
-        Si no puede decidir → coma (estándar RFC 4180).
-        """
         candidates = [",", ";", "\t", "|", ":"]
         try:
             with open(path, encoding=encoding, errors="replace") as f:
@@ -1135,13 +854,11 @@ class DatabaseManager:
             if not lines:
                 return ","
 
-            # Contar ocurrencias por candidato en cada línea
             scores: dict[str, list[int]] = {d: [] for d in candidates}
             for line in lines:
                 for d in candidates:
                     scores[d].append(line.count(d))
 
-            # El delimitador consistente tiene conteo > 0 y baja varianza
             best_delim = ","
             best_score = -1
             for d in candidates:
@@ -1149,7 +866,6 @@ class DatabaseManager:
                 if not counts or max(counts) == 0:
                     continue
                 avg = sum(counts) / len(counts)
-                # penalizar si las líneas tienen conteos muy distintos
                 variance = sum((c - avg) ** 2 for c in counts) / len(counts)
                 score = avg - variance * 0.1
                 if score > best_score:
@@ -1161,52 +877,14 @@ class DatabaseManager:
             return ","
 
     def load_csv(self, path: str) -> list[str]:
-        """
-        Carga CSV con detección automática de encoding y delimitador.
-        Nivel SGBD profesional:
-
-        ENCODING (auto-detectado):
-          UTF-8, UTF-8 BOM (Excel), UTF-16, UTF-32,
-          Windows-1252, ISO-8859-1 / Latin-1,
-          cualquier encoding de 1 byte (fallback latin-1)
-
-        DELIMITADOR (auto-detectado):
-          , ; \\t | :   — detecta el más consistente en las primeras 5 líneas
-
-        CABECERA (auto-detectada):
-          Se compara la primera fila con los nombres de columna del esquema
-          (insensible a mayúsculas y espacios). Si coincide → tiene cabecera.
-          Si no coincide → sin cabecera: se mapean las columnas del schema
-          en orden posicional. Nunca se usan nombres genéricos col_0, col_1.
-
-        COLUMNAS:
-          - Extra en CSV  → ignoradas, aviso
-          - Faltantes del esquema → valor vacío, aviso
-          - Sin cabecera  → mapeo posicional usando nombres del schema SQL
-
-        FILAS:
-          - PK duplicada  → omite la segunda, avisa
-          - Error de cast → usa valor vacío, registra en log (no aborta)
-          - Fila vacía    → silenciosamente ignorada
-          - Fila con menos columnas que el encabezado → rellena con vacío
-          - Fila con más columnas que el encabezado → ignora las extra
-
-        RETORNA: lista de strings de advertencia (vacía = todo perfecto)
-        """
         if not self.schema:
             raise RuntimeError("Carga el esquema primero")
 
         warnings: list[str] = []
-
-        # ── 1. Detectar encoding ──────────────────────────────────────────
         encoding = self._detect_encoding(path)
-
-        # ── 2. Detectar delimitador ───────────────────────────────────────
         delimiter = self._detect_delimiter(path, encoding)
 
-        # ── 3. Abrir y leer ───────────────────────────────────────────────
         with open(path, newline="", encoding=encoding, errors="replace") as f:
-            # Quitar BOM si quedó como carácter (utf-8-sig no siempre lo quita)
             sample = f.read(3)
             if sample.startswith("\ufeff"):
                 sample = sample[1:]
@@ -1215,21 +893,16 @@ class DatabaseManager:
                 sample = ""
             content = sample + f.read()
 
-        # ── 4. Leer primera fila para detectar cabecera ───────────────────
         reader_f   = io.StringIO(content)
         first_row  = next(csv.reader(reader_f, delimiter=delimiter), [])
         schema_names = [c.name for c in self.schema.columns]
 
         def _normalise(s: str) -> str:
-            """Quita espacios, BOM y pasa a minúsculas para comparar."""
             return s.strip().lstrip("\ufeff").lower()
 
         first_row_norm   = [_normalise(f) for f in first_row]
         schema_names_norm = [_normalise(n) for n in schema_names]
 
-        # Tiene cabecera si al menos la MITAD de los campos de la primera fila
-        # coinciden con nombres de columna del schema (comparación insensible).
-        # Esto es robusto: funciona aunque el CSV tenga columnas extra o falten.
         if schema_names_norm and first_row_norm:
             schema_set  = set(schema_names_norm)
             matches     = sum(1 for f in first_row_norm if f in schema_set)
@@ -1237,22 +910,17 @@ class DatabaseManager:
         else:
             has_header = False
 
-        # ── 5. Construir DictReader con los fieldnames correctos ──────────
         reader_f.seek(0)
 
         if has_header:
-            # La primera fila es la cabecera: DictReader la usa directamente
             reader     = csv.DictReader(reader_f, delimiter=delimiter)
             fieldnames = [_normalise(f) for f in (reader.fieldnames or [])]
-            # Re-crear con nombres normalizados para que el mapeo funcione
             reader_f.seek(0)
-            reader_f.readline()   # saltar la fila de cabecera original
+            reader_f.readline()
             reader = csv.DictReader(reader_f,
                                     fieldnames=fieldnames,
                                     delimiter=delimiter)
         else:
-            # Sin cabecera: mapear posicionalmente usando nombres del schema.
-            # Si el CSV tiene MÁS columnas que el schema → nombres extra col_N.
             n_csv_cols   = len(first_row)
             if n_csv_cols > len(schema_names):
                 extra_names = [f"_col_{i}" for i in range(len(schema_names),
@@ -1269,7 +937,6 @@ class DatabaseManager:
                 f"usando el esquema SQL: {', '.join(schema_names)}"
             )
 
-        # ── 6. Verificar cobertura de columnas ────────────────────────────
         schema_cols  = set(schema_names)
         csv_cols_set = set(fieldnames)
 
@@ -1294,83 +961,124 @@ class DatabaseManager:
         elif encoding not in ("utf-8", "utf-8-sig"):
             warnings.append(f"Encoding detectado: {encoding}")
 
-        # ── 7. Iterar filas ───────────────────────────────────────────────
-        pk_col        = self.schema.pk_column
-        dup_pks: int  = 0
-        err_rows: int = 0
+        pk_cols          = self.schema.pk_columns
+        pk_set           = set(pk_cols)
+        dup_pks: int     = 0
+        notnull_viol: int = 0
+        unique_viol: int  = 0
+        type_viol: int    = 0
+        err_rows: int    = 0
 
         for line_num, raw_row in enumerate(reader, start=2):
-            # Limpiar nombres de campo de la fila
             row = {
                 k.strip().lstrip("\ufeff"): v
                 for k, v in (raw_row or {}).items()
                 if k is not None
             }
 
-            # Fila completamente vacía → ignorar
             if not any(v and str(v).strip() for v in row.values()):
                 continue
 
             try:
-                # Rellenar columnas faltantes con vacío
                 for col in self.schema.columns:
                     if col.name not in row:
                         row[col.name] = ""
 
-                # ── PK vacía → generar una sintética para no perder el registro ──
-                # IMPORTANTE: se evalúa sobre el valor CRUDO del CSV (antes de
-                # castear). Si se evaluara sobre el valor casteado, una PK
-                # INT/FLOAT vacía se convierte en 0/0.0 (ver ColumnDef.cast) y
-                # esta condición nunca se cumple — bug crítico confirmado que
-                # perdía silenciosamente todas las filas con PK vacía salvo
-                # la primera (las demás se rechazaban como "PK duplicada '0'").
-                raw_pk = row.get(pk_col, "")
-                raw_pk_empty = raw_pk is None or str(raw_pk).strip() == ""
+                raw_pk_parts = [row.get(c, "") for c in pk_cols]
+                raw_pk_empty = all(
+                    p is None or str(p).strip() == "" for p in raw_pk_parts
+                )
 
-                casted = self.schema.cast_row(row)
-                # Filtrar columnas que no están en el esquema: el aviso dice
-                # "ignoradas", así que deben quedar realmente fuera del
-                # registro guardado (antes contaminaban el disco simulado).
+                null_col = next(
+                    (c.name for c in self.schema.columns
+                     if c.not_null and c.name not in pk_set
+                     and (row.get(c.name) is None
+                          or str(row.get(c.name)).strip() == "")),
+                    None
+                )
+                if null_col:
+                    notnull_viol += 1
+                    if notnull_viol <= 5:
+                        warnings.append(
+                            f"Fila {line_num}: ERROR — violación de restricción "
+                            f"NOT NULL: la columna '{null_col}' no puede estar "
+                            f"vacía — INSERT rechazado."
+                        )
+                    continue
+
+                try:
+                    casted = self.schema.cast_row(row)
+                except TypeViolation as tv:
+                    type_viol += 1
+                    if type_viol <= 5:
+                        warnings.append(
+                            f"Fila {line_num}: ERROR — tipo de dato inválido: "
+                            f"{tv} — INSERT rechazado."
+                        )
+                    continue
                 casted = {k: v for k, v in casted.items() if k in schema_cols}
 
                 if raw_pk_empty:
-                    pk_val = f"__auto_{self.records_loaded}"
-                    casted[pk_col] = pk_val
+                    auto_val = f"__auto_{self.records_loaded}"
+                    casted[pk_cols[0]] = auto_val
+                    pk_val = self.schema.pk_value(casted)
                     if self.records_loaded < 5:
                         warnings.append(
                             f"Fila {line_num}: PK vacía — asignada clave "
-                            f"automática '{pk_val}'."
+                            f"automática '{auto_val}'."
                         )
                 else:
-                    pk_val = casted.get(pk_col, "")
+                    pk_val = self.schema.pk_value(casted)
 
-                # Verificar unicidad de PK antes de almacenar.
-                # Equivalente al check de restricción PRIMARY KEY en un SGBD:
-                # PostgreSQL: "ERROR: duplicate key value violates unique constraint"
                 if pk_val in self._records:
                     dup_pks += 1
                     if dup_pks <= 5:
                         warnings.append(
                             f"Fila {line_num}: ERROR — violación de restricción "
-                            f"PRIMARY KEY: la clave duplicada '{pk_val}' ya existe "
+                            f"PRIMARY KEY: la clave duplicada "
+                            f"{self.schema.format_pk(pk_val)} ya existe "
                             f"— INSERT rechazado."
                         )
                     continue
+
+                uniq_hit = None
+                for group in self.schema.unique_groups:
+                    gkey = tuple(group)
+                    val  = tuple(casted.get(c, "") for c in group)
+                    seen = self._unique_seen.get(gkey, set())
+                    if val in seen:
+                        uniq_hit = (group, val)
+                        break
+                if uniq_hit:
+                    group, val = uniq_hit
+                    unique_viol += 1
+                    if unique_viol <= 5:
+                        label = group[0] if len(group) == 1 else \
+                                "(" + ", ".join(group) + ")"
+                        vdisp = val[0] if len(val) == 1 else \
+                                "(" + ", ".join(str(v) for v in val) + ")"
+                        warnings.append(
+                            f"Fila {line_num}: ERROR — violación de restricción "
+                            f"UNIQUE en {label}: el valor {vdisp} ya existe "
+                            f"— INSERT rechazado."
+                        )
+                    continue
+
+                for group in self.schema.unique_groups:
+                    gkey = tuple(group)
+                    val  = tuple(casted.get(c, "") for c in group)
+                    self._unique_seen.setdefault(gkey, set()).add(val)
 
                 self._store(casted)
                 self.records_loaded += 1
 
             except OverflowError:
-                # ── DISCO LLENO: parar la carga inmediatamente ────────────────
-                # Comportamiento SGBD profesional: si el medio de almacenamiento
-                # está lleno no tiene sentido intentar insertar más filas.
-                # El write_record ya hizo rollback del registro parcial.
                 warnings.append(
                     f"Fila {line_num}: DISCO LLENO — carga interrumpida. "
                     f"Se cargaron {self.records_loaded} registro(s) correctamente "
                     f"antes de agotar el espacio disponible."
                 )
-                break   # salir del loop de filas
+                break
 
             except Exception as exc:
                 err_rows += 1
@@ -1379,35 +1087,27 @@ class DatabaseManager:
                         f"Fila {line_num}: error ({exc}) — omitida."
                     )
 
-        # Resumen final si hubo muchos errores/duplicados
         if dup_pks > 5:
             warnings.append(f"… y {dup_pks - 5} violación(es) de PRIMARY KEY más — INSERT rechazado.")
+        if notnull_viol > 5:
+            warnings.append(f"… y {notnull_viol - 5} violación(es) de NOT NULL más — INSERT rechazado.")
+        if unique_viol > 5:
+            warnings.append(f"… y {unique_viol - 5} violación(es) de UNIQUE más — INSERT rechazado.")
+        if type_viol > 5:
+            warnings.append(f"… y {type_viol - 5} fila(s) con tipo de dato inválido más — INSERT rechazado.")
         if err_rows > 5:
             warnings.append(f"… y {err_rows - 5} fila(s) con error más omitidas.")
 
-        # Invalidar índices AVL cacheados: si load_csv se llama más de una
-        # vez sobre la misma instancia (la GUI actual no lo hace, pero la
-        # API pública de la clase lo permite), los índices construidos antes
-        # de esta carga quedarían desactualizados — bug confirmado y
-        # corregido. Se reconstruyen perezosamente en la próxima búsqueda.
         self.indices.clear()
 
-        # Advertencias del parser SQL (PKs compuestas, etc.)
         if hasattr(self.schema, "_pk_warnings"):
             warnings = self.schema._pk_warnings + warnings
 
         return warnings
 
     def _store(self, row: dict):
-        """
-        Guarda el registro en disco. No toca ningún AVL (lazy indexing).
-        row ya viene casteado por schema.cast_row() desde load_csv,
-        así que pk_val tiene el tipo correcto directamente.
-        Precondición: load_csv ya validó que pk_val no es vacío ni duplicado.
-        """
-        raw    = json.dumps(row, ensure_ascii=False).encode("utf-8")
-        pk_col = self.schema.pk_column
-        pk_val = row[pk_col]   # siempre presente y casteado por cast_row()
+        raw       = _serialize_record(self.schema, row)
+        pk_val    = self.schema.pk_value(row)
         fragments = self.disk.write_record(raw)
         self._records[pk_val] = {
             "record":    row,
@@ -1415,34 +1115,19 @@ class DatabaseManager:
             "raw_len":   len(raw),
         }
 
-    # ── construcción de índice por demanda ────────────────────────────────────
 
     def _build_index(self, col: str) -> AVL:
-        """
-        Construye el AVL de la columna `col` si no existe todavía.
-        Si ya existe lo retorna directamente sin reconstruir (lazy indexing).
-
-        Índice primario (col == pk_col) → AVL(unique=True)
-            Un nodo por clave, sin duplicados. Idéntico al B-Tree primario
-            de PostgreSQL/MySQL: una clave → un puntero a fragments en disco.
-
-        Índice secundario (col != pk_col) → AVL(unique=False)
-            Un nodo por valor distinto, cada nodo acumula lista de PKs.
-            Equivalente a un índice no-único (CREATE INDEX sin UNIQUE).
-        """
         if col in self.indices:
             return self.indices[col]
 
         pk_col = self.schema.pk_column
-        is_pk  = (col == pk_col)
+        is_pk  = (col == pk_col) and not self.schema.is_composite_pk
         avl    = AVL(unique=is_pk)
 
         for pk_val, meta in self._records.items():
             if is_pk:
-                # Primario: key=pk_val → value=fragments (un único valor por clave)
                 avl.insert(pk_val, meta["fragments"])
             else:
-                # Secundario: key=valor_columna → value=pk (acumula PKs)
                 attr_val = meta["record"].get(col, "")
                 avl.insert(attr_val, pk_val)
 
@@ -1452,26 +1137,15 @@ class DatabaseManager:
     def index_exists(self, col: str) -> bool:
         return col in self.indices
 
-    # ── helpers ───────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _coerce(v: Any) -> Any:
-        try:    return int(v)
-        except (ValueError, TypeError): pass
-        try:    return float(v)
-        except (ValueError, TypeError): pass
-        return str(v)
-
     def _fetch_by_pk(self, pk_val) -> Optional[dict]:
-        """Lee un registro del disco dado su PK."""
         meta = self._records.get(pk_val)
         if meta is None:
             return None
-        frags = meta["fragments"]
-        raw   = self.disk.read_record(frags)
-        try:    record = json.loads(raw.decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            record = {"_raw": raw.hex()}
+        frags  = meta["fragments"]
+        raw    = self.disk.read_record(frags)
+        record = _deserialize_record(self.schema, raw)
+        if not record:
+            record = {"_raw_hex": raw.hex()}
 
         addr_info = []
         for pid, slot_idx in frags:
@@ -1489,31 +1163,26 @@ class DatabaseManager:
         return {"pk": pk_val, "record": record,
                 "direcciones": addr_info, "raw_len": len(raw)}
 
-    # ── búsquedas (construyen el índice si no existe) ─────────────────────────
 
     def _cast_for_col(self, col: str, value: str) -> Any:
-        """
-        Castea `value` al tipo real de la columna según el esquema.
-        Más preciso que _coerce: evita que "0123" se convierta a 123.
-        """
         col_def = next((c for c in self.schema.columns
                         if c.name == col), None)
         if col_def:
             return col_def.cast(value)
-        return self._coerce(value)   # fallback si la columna no está en schema
+        return value
 
     def search(self, col: str, value: str) -> list[dict]:
-        """Búsqueda exacta. Construye el AVL de `col` si no existe."""
         if not self.schema or col not in self.columns:
             return []
         pk_col  = self.schema.pk_column
-        coerced = self._cast_for_col(col, value)   # usa el tipo del schema
-        avl     = self._build_index(col)            # lazy: crea o reutiliza
+        is_simple_pk_col = (col == pk_col) and not self.schema.is_composite_pk
+        coerced = self._cast_for_col(col, value)
+        avl     = self._build_index(col)
         values  = avl.search(coerced)
         if not values:
             return []
 
-        if col == pk_col:
+        if is_simple_pk_col:
             result = self._fetch_by_pk(coerced)
             return [result] if result else []
         else:
@@ -1526,18 +1195,18 @@ class DatabaseManager:
             return out
 
     def range_search(self, col: str, lo: str, hi: str) -> list[dict]:
-        """Búsqueda por rango. Construye el AVL de `col` si no existe."""
         if not self.schema or col not in self.columns:
             return []
         pk_col = self.schema.pk_column
-        lo_v   = self._cast_for_col(col, lo)   # usa el tipo del schema
-        hi_v   = self._cast_for_col(col, hi)   # usa el tipo del schema
-        avl    = self._build_index(col)         # lazy: crea o reutiliza
+        is_simple_pk_col = (col == pk_col) and not self.schema.is_composite_pk
+        lo_v   = self._cast_for_col(col, lo)
+        hi_v   = self._cast_for_col(col, hi)
+        avl    = self._build_index(col)
         hits   = avl.range_search(lo_v, hi_v)
 
         out = []; seen = set()
         for key, values in hits:
-            if col == pk_col:
+            if is_simple_pk_col:
                 if key not in seen:
                     seen.add(key)
                     r = self._fetch_by_pk(key)
@@ -1559,9 +1228,6 @@ class DatabaseManager:
         return self.schema.pk_column if self.schema else None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  APLICACIÓN
-# ══════════════════════════════════════════════════════════════════════════════
 
 class App(ctk.CTk):
 
@@ -1580,10 +1246,6 @@ class App(ctk.CTk):
 
         self._build_ui()
 
-    # ──────────────────────────────────────────────────────────────────────────
-    #  CONSTRUCCIÓN UI
-    # ──────────────────────────────────────────────────────────────────────────
-
     def _build_ui(self):
         self.grid_columnconfigure(0, weight=0, minsize=440)
         self.grid_columnconfigure(1, weight=1)
@@ -1601,13 +1263,8 @@ class App(ctk.CTk):
                      font=("Consolas",16,"bold"),
                      text_color=ACCENT).grid(
             row=r, column=0, sticky="w", pady=(0,2)); r+=1
-        ctk.CTkLabel(left,
-                     text="Avance 1 — Modelado del Problema  |  Slotted Pages",
-                     font=FL, text_color=MUTED).grid(
-            row=r, column=0, sticky="w", pady=(0,14)); r+=1
 
-        # ── Sección 1: Geometría ──────────────────────────────────────────────
-        r = self._section(left, r, "① GEOMETRÍA DEL DISCO",
+        r = self._section(left, r, "(1) GEOMETRÍA DEL DISCO",
                           ACCENT, ACCENT_D, ACCENT_H)
 
         self._vp = tk.IntVar(value=2)
@@ -1627,7 +1284,9 @@ class App(ctk.CTk):
             left,
             text=(f"ℹ  Slotted pages: varios registros comparten\n"
                   f"   una misma página. Sin padding desperdiciado.\n"
-                  f"   Header fijo: {PAGE_HDR_SIZE}B | Slot: {SLOT_SIZE}B c/u"),
+                  f"   Header fijo: {PAGE_HDR_SIZE}B | Slot: {SLOT_SIZE}B c/u\n"
+                  f"   Registros: binario puro (INT=4B, FLOAT=8B,\n"
+                  f"   VARCHAR=2B+datos). Sin nombres de columna en disco."),
             font=("Consolas",8), text_color=MUTED,
             justify="left").grid(row=r, column=0, sticky="w", pady=(0,6)); r+=1
 
@@ -1658,8 +1317,7 @@ class App(ctk.CTk):
                       command=self._cmd_configure).grid(
             row=r, column=0, sticky="ew", pady=(0,12)); r+=1
 
-        # ── Sección 2: Archivos ───────────────────────────────────────────────
-        r = self._section(left, r, "② ESQUEMA (.txt) Y DATOS (.csv)",
+        r = self._section(left, r, "(2) ESQUEMA (.txt) Y DATOS (.csv)",
                           YELLOW, YELLOW_D, YELLOW_H)
 
         self._txt_path = None
@@ -1681,11 +1339,9 @@ class App(ctk.CTk):
                                         wraplength=420, justify="left")
         self._schema_lbl.grid(row=r, column=0, sticky="w", pady=(0,8)); r+=1
 
-        # ── Sección 3: Búsqueda ───────────────────────────────────────────────
-        r = self._section(left, r, "③ BÚSQUEDA",
+        r = self._section(left, r, "(3) BÚSQUEDA",
                           GREEN, GREEN_D, GREEN_H)
 
-        # Selector de columna
         ctk.CTkLabel(left, text="Buscar por columna:",
                      font=FL, text_color=MUTED).grid(
             row=r, column=0, sticky="w", pady=(0,2)); r+=1
@@ -1751,7 +1407,6 @@ class App(ctk.CTk):
         self._result_box.grid(row=r, column=0, sticky="ew",
                               pady=(0,12)); r+=1
 
-        # ── Log ───────────────────────────────────────────────────────────────
         r = self._section(left, r, "LOG DEL SISTEMA", MUTED, MUTED_D, BORDER)
 
         self._log_box = ctk.CTkTextbox(left, height=110, font=FMS,
@@ -1759,7 +1414,7 @@ class App(ctk.CTk):
                                        border_color=BORDER, border_width=1)
         self._log_box.grid(row=r, column=0, sticky="ew", pady=(0,8)); r+=1
 
-        ctk.CTkButton(left, text="⟳  Reiniciar",
+        ctk.CTkButton(left, text="Reiniciar",
                       fg_color=RED_D, text_color=RED,
                       border_color=RED, border_width=1,
                       hover_color=RED_H, font=FT,
@@ -1780,7 +1435,6 @@ class App(ctk.CTk):
             font=FT, text_color=ACCENT).grid(
             row=0, column=0, sticky="w", pady=(0,4))
 
-        # Canvas con scrollbars
         cf = tk.Frame(right, bg=BG)
         cf.grid(row=1, column=0, sticky="nsew", pady=(0,10))
         cf.grid_rowconfigure(0, weight=1)
@@ -1805,7 +1459,6 @@ class App(ctk.CTk):
         self._disk_canvas.bind("<Leave>",    lambda e: self._hide_tip())
         self._disk_canvas.bind("<Button-1>", self._on_click)
 
-        # Tooltip
         self._tip = tk.Toplevel(self)
         self._tip.withdraw()
         self._tip.overrideredirect(True)
@@ -1823,10 +1476,6 @@ class App(ctk.CTk):
         self._avl_canvas = tk.Canvas(right, bg=PANEL,
                                      highlightthickness=0, height=200)
         self._avl_canvas.grid(row=3, column=0, sticky="nsew")
-
-    # ──────────────────────────────────────────────────────────────────────────
-    #  HELPERS UI
-    # ──────────────────────────────────────────────────────────────────────────
 
     def _section(self, parent, row, text, color, bg, hover):
         frame = ctk.CTkFrame(parent, fg_color=bg, corner_radius=4,
@@ -1904,6 +1553,9 @@ class App(ctk.CTk):
         else:
             for item in results:
                 self._result_box.insert("end", "\n")
+                self._result_box.insert(
+                    "end",
+                    f"  [Tamaño en disco: {item['raw_len']} B binarios]\n")
                 for k, v in item["record"].items():
                     self._result_box.insert("end", f"  {k}: {v}\n")
                 self._result_box.insert("end", f"  {'─'*30}\n")
@@ -1921,14 +1573,8 @@ class App(ctk.CTk):
 
         self._result_box.configure(state="disabled")
 
-    # ──────────────────────────────────────────────────────────────────────────
-    #  COMANDOS
-    # ──────────────────────────────────────────────────────────────────────────
-
     def _cmd_configure(self):
         try:
-            if self.disk:
-                self.disk.close()   # cerrar disco anterior
             cfg = DiskConfig(self._vp.get(), self._vt.get(),
                              self._vs.get(), self._vb.get())
             if cfg.platters <= 0 or cfg.tracks_per_surface <= 0 \
@@ -1958,7 +1604,6 @@ class App(ctk.CTk):
         if not self._csv_path:
             messagebox.showwarning("Aviso","Selecciona los datos (.csv)"); return
         try:
-            self.disk.close()
             self.disk = Disk(self.disk.config)
             self.db   = DatabaseManager(self.disk)
             schema_warnings = self.db.load_schema(self._txt_path)
@@ -1967,10 +1612,10 @@ class App(ctk.CTk):
                 f"{'[PK]' if c.is_pk else ''}{c.name}:{c.py_type.__name__}"
                 for c in sch.columns)
             self._schema_lbl.configure(
-                text=f"Tabla: {sch.name}  |  PK: {sch.pk_column}\n{cols_txt}")
+                text=f"Tabla: {sch.name}  |  PK: {sch.pk_label}\n{cols_txt}")
             n_cols = len(sch.columns)
             self._log(
-                f"Esquema: '{sch.name}'  PK='{sch.pk_column}'  "
+                f"Esquema: '{sch.name}'  PK={sch.pk_label}  "
                 f"→  {n_cols} columnas detectadas", GREEN)
             for w in schema_warnings:
                 self._log(f"⚠  {w}", YELLOW)
@@ -1981,7 +1626,6 @@ class App(ctk.CTk):
             self._log(f"{self.db.records_loaded} registros  ·  "
                       f"{pages} página(s) usada(s)", GREEN)
 
-            # Mostrar advertencias (columnas faltantes, PKs duplicadas, encoding, etc.)
             if csv_warnings:
                 for w in csv_warnings:
                     self._log(f"⚠  {w}", YELLOW)
@@ -1990,19 +1634,17 @@ class App(ctk.CTk):
                     "Advertencias al cargar",
                     "\n\n".join(all_warnings)
                 )
-            # estadísticas de ocupación
             occ_list = [self.disk.get_page(i).occupancy_pct
                         for i in range(pages)]
             avg_occ = sum(occ_list)/len(occ_list) if occ_list else 0
             self._log(f"Ocupación promedio de páginas: {avg_occ:.1f}%", ACCENT)
 
             self._highlighted_pks = set()
-            # poblar selector de columnas (todos los atributos)
             cols = self.db.columns
             self._col_menu.configure(values=cols)
             self._col_var.set(self.db.pk_column or cols[0])
             self._draw_disk()
-            self._draw_avl()   # muestra "índice no existe aún" (ver _draw_avl)
+            self._draw_avl()
         except Exception as ex:
             messagebox.showerror("Error al cargar", str(ex))
             self._log(f"ERROR: {ex}", RED)
@@ -2041,8 +1683,6 @@ class App(ctk.CTk):
             self._log(f"Error: {ex}", RED)
 
     def _cmd_reset(self):
-        if self.disk:
-            self.disk.close()   # flush + cerrar archivo
         self.disk = None; self.db = None
         self._highlighted_pks = set(); self._sector_items = {}
         self._disk_canvas.delete("all"); self._avl_canvas.delete("all")
@@ -2057,10 +1697,6 @@ class App(ctk.CTk):
         self._col_var.set("— carga datos primero —")
         self._log("Sistema reiniciado.", MUTED)
 
-    # ──────────────────────────────────────────────────────────────────────────
-    #  DIBUJO: MAPA DEL DISCO
-    # ──────────────────────────────────────────────────────────────────────────
-
     def _draw_disk(self):
         c = self._disk_canvas
         c.delete("all")
@@ -2072,7 +1708,6 @@ class App(ctk.CTk):
         TRACK_H = SH + SG
         PAD     = 10; LABEL_W = 50
 
-        # pid → set de pks que tienen fragmentos en esa página
         pid_pks: dict[int, set] = {}
         if self.db:
             for pk, meta in self.db._records.items():
@@ -2130,7 +1765,6 @@ class App(ctk.CTk):
                                 x, y, x+SW, y+SH,
                                 fill=bg_col, outline=ol_col, width=1)
 
-                            # barra de ocupación
                             bar_h   = max(2, int(SH * occ / 100))
                             bar_col = (YELLOW if hi
                                        else (GREEN if occ >= 99.9 else ORANGE))
@@ -2138,7 +1772,6 @@ class App(ctk.CTk):
                                 x+1, y+SH-bar_h, x+SW-1, y+SH-1,
                                 fill=bar_col, outline="")
 
-                            # indicador multi-registro
                             if len(pks) > 1:
                                 c.create_rectangle(
                                     x+SW-4, y, x+SW, y+4,
@@ -2149,13 +1782,11 @@ class App(ctk.CTk):
                                     "pi": pi, "si": si,
                                     "ti": ti, "seci": seci}
                         elif page:
-                            # página abierta pero vacía (primera página)
                             item = c.create_rectangle(
                                 x, y, x+SW, y+SH,
                                 fill="#1a2d40", outline=BORDER, width=1)
                             info = None
                         else:
-                            # página no asignada
                             item = c.create_rectangle(
                                 x, y, x+SW, y+SH,
                                 fill="#0d1520", outline="#131f30", width=1)
@@ -2170,7 +1801,6 @@ class App(ctk.CTk):
                 y += 6
             y += 12
 
-        # Leyenda
         leg = [(PLATTER[0],"Llena 100%"),
                (PLATTER_D[0],"Parcial"),
                (YELLOW,"Resultado"),
@@ -2188,9 +1818,6 @@ class App(ctk.CTk):
         y += 20
         c.configure(scrollregion=(0, 0, total_w, y+PAD))
 
-    # ──────────────────────────────────────────────────────────────────────────
-    #  HOVER Y CLICK
-    # ──────────────────────────────────────────────────────────────────────────
 
     def _find_item(self, event) -> Optional[int]:
         cx = self._disk_canvas.canvasx(event.x)
@@ -2232,9 +1859,6 @@ class App(ctk.CTk):
             self._popup_page(d["pid"], d["pi"], d["si"],
                              d["ti"], d["seci"], d["info"])
 
-    # ──────────────────────────────────────────────────────────────────────────
-    #  POPUP DETALLE DE PÁGINA
-    # ──────────────────────────────────────────────────────────────────────────
 
     def _popup_page(self, pid, pi, si, ti, seci, info):
         pop = tk.Toplevel(self)
@@ -2243,12 +1867,8 @@ class App(ctk.CTk):
         pop.resizable(True, True)
         pop.geometry("640x560")
         pop.minsize(500, 320)
-
-        pop.wait_visibility()
-
         pop.grab_set()
 
-        # ── Contenedor scrollable ──────────────────────────────────────────
         outer = tk.Frame(pop, bg=PANEL)
         outer.pack(fill="both", expand=True)
         outer.grid_rowconfigure(0, weight=1)
@@ -2263,7 +1883,6 @@ class App(ctk.CTk):
         _hsb.grid(row=1, column=0, sticky="ew")
         _canvas.grid(row=0, column=0, sticky="nsew")
 
-        # Frame interior donde va todo el contenido
         inner = tk.Frame(_canvas, bg=PANEL)
         win_id = _canvas.create_window((0, 0), window=inner, anchor="nw")
 
@@ -2274,7 +1893,6 @@ class App(ctk.CTk):
         inner.bind("<Configure>", _on_inner_configure)
         _canvas.bind("<Configure>", _on_canvas_configure)
 
-        # Scroll con rueda del ratón
         def _on_wheel(e):
             _canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
         _canvas.bind("<MouseWheel>", _on_wheel)
@@ -2319,7 +1937,6 @@ class App(ctk.CTk):
                  fg=MUTED, font=("Consolas",9))
             sep()
 
-            # Barra visual de la página (se adapta al ancho)
             rlbl("ESTRUCTURA DE LA PÁGINA:", fg=MUTED,
                  font=("Consolas",9,"bold"))
             BAR_W = 560
@@ -2327,13 +1944,11 @@ class App(ctk.CTk):
                            bg=PANEL, highlightthickness=0)
             sc.pack(padx=20, pady=4, anchor="w")
 
-            # header
             hw = int(BAR_W * PAGE_HDR_SIZE / sz)
             sc.create_rectangle(0,6,hw,48, fill="#1a2d40", outline=ACCENT)
             sc.create_text(hw//2, 27, text=f"HDR\n{PAGE_HDR_SIZE}B",
                            fill=ACCENT, font=("Consolas",7,"bold"))
 
-            # slots de datos (colores alternos)
             colors_slot = [GREEN, ORANGE, ACCENT2, YELLOW, RED]
             slot_x = hw
             for i, (off, ln) in enumerate(page.slots):
@@ -2347,7 +1962,6 @@ class App(ctk.CTk):
                                    fill=DARK, font=("Consolas",7,"bold"))
                 slot_x += sw2
 
-            # espacio libre
             free_x = hw + int(BAR_W * used / sz)
             free_w = BAR_W - free_x - int(BAR_W * page.slot_count * SLOT_SIZE / sz)
             if free_w > 0:
@@ -2358,7 +1972,6 @@ class App(ctk.CTk):
                                    text=f"libre\n{free}B",
                                    fill=MUTED, font=("Consolas",7))
 
-            # slot directory (al final)
             sd_w = int(BAR_W * page.slot_count * SLOT_SIZE / sz)
             if sd_w > 0:
                 sc.create_rectangle(BAR_W-sd_w, 6, BAR_W, 48,
@@ -2370,7 +1983,6 @@ class App(ctk.CTk):
 
             sep()
 
-            # Detalle por slot
             rlbl("SLOTS:", fg=MUTED, font=("Consolas",9,"bold"))
             if self.db:
                 slot_pks: dict[tuple,str] = {}
@@ -2381,20 +1993,20 @@ class App(ctk.CTk):
 
             for i, (off, ln) in enumerate(page.slots):
                 spk = slot_pks.get((pid, i), "?") if self.db else "?"
+                spk_disp = self.db.schema.format_pk(spk) if (self.db and spk != "?") else spk
                 col = colors_slot[i % len(colors_slot)]
                 tk.Label(inner,
                          text=f"  Slot {i}:  offset={off}  "
-                              f"len={ln}B  →  registro PK={spk}",
+                              f"len={ln}B  →  registro PK={spk_disp}",
                          bg=DARK, fg=col, font=("Consolas",10),
                          anchor="w").pack(fill="x", padx=20, pady=1)
             sep()
 
-            # Registros en esta página — usando Text widget para scroll horizontal
             rlbl("REGISTROS EN ESTA PÁGINA:", fg=MUTED,
                  font=("Consolas",9,"bold"))
             rec_txt = tk.Text(inner, bg=DARK, fg=TEXT,
                               font=("Consolas",9),
-                              wrap="none",          # sin wrap → scroll horizontal
+                              wrap="none",
                               relief="flat",
                               height=min(12, len(pks) * 3 + 2),
                               borderwidth=0)
@@ -2408,8 +2020,11 @@ class App(ctk.CTk):
                 meta = self.db._records.get(pk) if self.db else None
                 if meta:
                     rec  = meta["record"]
-                    line = "PK={}:  {}\n".format(
-                        pk, "  |  ".join(f"{k}={v}" for k, v in rec.items()))
+                    raw_len = meta["raw_len"]
+                    line = "PK={}  [{} B binarios]:  {}\n".format(
+                        self.db.schema.format_pk(pk),
+                        raw_len,
+                        "  |  ".join(f"{k}={v}" for k, v in rec.items()))
                     rec_txt.insert("end", line)
             rec_txt.configure(state="disabled")
 
@@ -2418,11 +2033,6 @@ class App(ctk.CTk):
                   bg="#1a2d40", fg=TEXT, font=("Consolas",10),
                   relief="flat", padx=16, pady=6).pack(pady=(0,14))
 
-    # ──────────────────────────────────────────────────────────────────────────
-    #  DIBUJO: ÁRBOL AVL
-    # ──────────────────────────────────────────────────────────────────────────
-
-    # Máximo de nodos a dibujar en el AVL antes de colapsar la UI
     AVL_DRAW_LIMIT = 300
 
     def _draw_avl(self):
@@ -2435,9 +2045,6 @@ class App(ctk.CTk):
             return
 
         if col not in self.db.indices:
-            # El índice se construye perezosamente en la primera búsqueda
-            # por esta columna. Mientras tanto, avisar en vez de dejar el
-            # lienzo en blanco sin explicación.
             W = c.winfo_width(); H = c.winfo_height()
             if W < 10: W = 600
             if H < 10: H = 200
@@ -2458,11 +2065,10 @@ class App(ctk.CTk):
         NR = 18; VG = 52
         hl = self._highlighted_pks
         pk_col = self.db.pk_column
+        is_simple_pk_col = (col == pk_col) and not self.db.schema.is_composite_pk
 
-        # ── Límite de nodos: con muchos registros dibujar congela la UI ──
         total_nodes = sum(len(lvl) for lvl in levels)
         if total_nodes > self.AVL_DRAW_LIMIT:
-            # Mostrar solo estadísticas + los nodos del path de búsqueda
             c.create_text(W//2, H//2 - 24,
                           text=f"Árbol AVL — {total_nodes} nodos",
                           fill=ACCENT2, font=("Consolas",13,"bold"),
@@ -2475,7 +2081,6 @@ class App(ctk.CTk):
                                f"Nodos únicos: {avl.size}  |  "
                                f"Col: {col}",
                           fill=ACCENT, font=("Consolas",9), anchor="center")
-            # si hay resultado de búsqueda, mostrarlo textualmente
             if hl:
                 c.create_text(W//2, H//2 + 50,
                               text=f"Resultado encontrado: {sorted(hl)}",
@@ -2506,8 +2111,7 @@ class App(ctk.CTk):
                 bf     = nd["bf"]
                 bf_col = GREEN if bf==0 else YELLOW if abs(bf)==1 else RED
 
-                # resaltar si algún PK asociado está en resultados
-                if col == pk_col:
+                if is_simple_pk_col:
                     node_hi = nd["key"] in hl
                 else:
                     found_pks = avl.search(nd["key"])
@@ -2517,7 +2121,6 @@ class App(ctk.CTk):
                               fill=YELLOW_H if node_hi else ACCENT2_D,
                               outline=YELLOW if node_hi else ACCENT2_B,
                               width=2)
-                # truncar key larga para que quepa en el nodo
                 key_str = str(nd["key"])
                 if len(key_str) > 8:
                     key_str = key_str[:7] + "…"
@@ -2527,20 +2130,14 @@ class App(ctk.CTk):
                 c.create_text(x, y+7, text=f"bf={bf:+d}",
                               fill=bf_col, font=("Consolas",7))
 
-        is_pk = col == pk_col
+        is_pk = is_simple_pk_col
         c.create_text(8, H-14, anchor="nw",
                       text=f"AVL [{col}]  {'(PK — primario)' if is_pk else '(secundario)'}  |  "
                            f"nodos únicos: {avl.size}  |  altura: {avl._height(avl.root)}",
                       fill=MUTED, font=("Consolas",8))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  ENTRY POINT
-# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     app = App()
     app.mainloop()
-    # al cerrar la ventana, flush y cerrar el archivo de disco
-    if app.disk:
-        app.disk.close()
