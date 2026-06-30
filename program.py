@@ -1,4 +1,4 @@
-"""06/29/2026 4:16pm
+"""
 Simulación de Almacenamiento Físico de Base de Datos
 CustomTkinter · Windows 11 · Python 3.12
 
@@ -42,7 +42,7 @@ import re
 import struct
 import tkinter as tk
 from tkinter import filedialog, messagebox
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from typing import Any, Optional
 
 import customtkinter as ctk
@@ -381,7 +381,7 @@ class Disk:
             self._next_pid    = next_pid_snapshot
             # Quitar next_page del encadenamiento si se había parcheado
             if pid_snapshot in self._pages:
-                self._pages[pid_snapshot].next_page = None
+                self._pages[pid_snapshot].next_page = NO_PAGE
             raise   # re-lanzar OverflowError al llamador
 
         return fragments
@@ -389,12 +389,23 @@ class Disk:
     # ── lectura ───────────────────────────────────────────────────────────────
 
     def read_record(self, fragments: list[tuple[int, int]]) -> bytes:
-        """Reconstruye el registro leyendo cada (page_id, slot_idx)."""
-        return b"".join(
-            page.read(slot_idx)
-            for pid, slot_idx in fragments
-            if (page := self._pages.get(pid))
-        )
+        """
+        Reconstruye el registro leyendo cada (page_id, slot_idx).
+        Lanza RuntimeError si algún fragmento referencia una página
+        inexistente — señal de corrupción de datos, igual que un
+        SGBD que detecta un bloque marcado como usado pero no asignado.
+        """
+        parts = []
+        for pid, slot_idx in fragments:
+            page = self._pages.get(pid)
+            if page is None:
+                raise RuntimeError(
+                    f"Corrupción detectada: el fragmento apunta a la página "
+                    f"{pid} que no existe en el disco. "
+                    f"El índice puede estar desincronizado."
+                )
+            parts.append(page.read(slot_idx))
+        return b"".join(parts)
 
     def get_page(self, pid: int) -> Optional[SlottedPage]:
         return self._pages.get(pid)
@@ -466,34 +477,34 @@ class AVL:
         self.size:   int  = 0
         self.unique: bool = unique
 
-    def _h(self, n) -> int:
+    def _height(self, n) -> int:
         return n.height if n else 0
 
-    def _bf(self, n) -> int:
-        return self._h(n.left) - self._h(n.right)
+    def _balance_factor(self, n) -> int:
+        return self._height(n.left) - self._height(n.right)
 
-    def _upd(self, n):
-        n.height = 1 + max(self._h(n.left), self._h(n.right))
+    def _update_height(self, n):
+        n.height = 1 + max(self._height(n.left), self._height(n.right))
 
-    def _rot_right(self, y):
+    def _rotate_right(self, y):
         x = y.left; y.left = x.right; x.right = y
-        self._upd(y); self._upd(x); return x
+        self._update_height(y); self._update_height(x); return x
 
-    def _rot_left(self, x):
+    def _rotate_left(self, x):
         y = x.right; x.right = y.left; y.left = x
-        self._upd(x); self._upd(y); return y
+        self._update_height(x); self._update_height(y); return y
 
     def _balance(self, n):
-        self._upd(n)
-        bf = self._bf(n)
+        self._update_height(n)
+        bf = self._balance_factor(n)
         if bf > 1:
-            if self._bf(n.left) < 0:
-                n.left = self._rot_left(n.left)
-            return self._rot_right(n)
+            if self._balance_factor(n.left) < 0:
+                n.left = self._rotate_left(n.left)
+            return self._rotate_right(n)
         if bf < -1:
-            if self._bf(n.right) > 0:
-                n.right = self._rot_right(n.right)
-            return self._rot_left(n)
+            if self._balance_factor(n.right) > 0:
+                n.right = self._rotate_right(n.right)
+            return self._rotate_left(n)
         return n
 
     def _insert(self, node, key, value) -> tuple:
@@ -548,7 +559,7 @@ class AVL:
         while queue:
             next_q = []; level = []
             for node, nid, pid, side in queue:
-                level.append({"key": node.key, "bf": self._bf(node),
+                level.append({"key": node.key, "bf": self._balance_factor(node),
                               "h": node.height, "id": nid,
                               "pid": pid, "side": side})
                 if node.left:  next_q.append((node.left,  nid*2+1, nid, "L"))
@@ -560,6 +571,13 @@ class AVL:
 # ══════════════════════════════════════════════════════════════════════════════
 #  ESQUEMA SQL
 # ══════════════════════════════════════════════════════════════════════════════
+
+# Tokens de texto que representan booleanos en CSVs reales (exports de
+# PostgreSQL, pandas, JSON, etc.). Sin esto, cast() intentaba float("true")
+# y todo terminaba silenciosamente en 0 — incluso los valores verdaderos.
+_BOOL_TRUE_TOKENS:  set[str] = {"true", "t", "sí", "si", "verdadero", "yes", "y"}
+_BOOL_FALSE_TOKENS: set[str] = {"false", "f", "no", "falso", "n"}
+
 
 @dataclass
 class ColumnDef:
@@ -574,7 +592,10 @@ class ColumnDef:
         Castea `v` al tipo de la columna de forma tolerante.
         - Valores vacíos/None → 0, 0.0 o "" según el tipo (no crashea)
         - "10.0" en columna INT → 10  (via float intermedio)
-        - Texto en columna INT → 0   (valor seguro por defecto)
+        - "true"/"false" (y variantes en español) en columna INT/BOOLEAN → 1/0
+          (antes se intentaba float("true") y todo terminaba en 0, incluso
+          los valores "true" — bug crítico de corrupción silenciosa, corregido)
+        - Texto no reconocido en columna INT → 0   (valor seguro por defecto)
         - Tipos desconocidos  → str(v)
         """
         # Valor vacío → default seguro según tipo
@@ -584,6 +605,12 @@ class ColumnDef:
             return ""
 
         if self.py_type is int:
+            if isinstance(v, str):
+                low = v.strip().lower()
+                if low in _BOOL_TRUE_TOKENS:
+                    return 1
+                if low in _BOOL_FALSE_TOKENS:
+                    return 0
             try:
                 return int(float(v))   # maneja "10.0", "10", 10.0
             except (ValueError, TypeError):
@@ -628,8 +655,8 @@ _INT_TYPES: set[str] = {
     # MySQL / MariaDB
     "MEDIUMINT", "INT1", "INT2", "INT3", "INT4", "INT8",
     "UNSIGNED", "SIGNED",
-    # PostgreSQL
-    "INT2", "INT4", "INT8", "SERIAL", "SMALLSERIAL", "BIGSERIAL",
+    # PostgreSQL (INT2/INT4/INT8 ya cubiertos arriba, mismo set)
+    "SERIAL", "SMALLSERIAL", "BIGSERIAL",
     "OID", "XID", "CID",
     # SQL Server
     "BIT",                          # 0/1 → int
@@ -637,8 +664,10 @@ _INT_TYPES: set[str] = {
     "ROWID",
     # Oracle
     "NUMBER",                       # sin decimales → int (ver _sql_to_py)
-    # DB2
-    "DECFLOAT",                     # entero cuando precision=0
+    # IBM DB2
+    # NOTA: "DECFLOAT" se maneja como NUMBER (ver _sql_to_py): sin escala → int,
+    # con escala > 0 → float. NO debe estar aquí también, o siempre ganaría int
+    # y truncaría los decimales (bug confirmado y corregido).
     # Alias comunes
     "BOOL", "BOOLEAN",              # internamente 0/1
     "YEAR",                         # MySQL YEAR → entero de 4 dígitos
@@ -672,10 +701,12 @@ def _sql_to_py(raw_type: str) -> type:
     Tipos desconocidos → str (nunca crashea).
 
     Reglas especiales:
-    - NUMBER(p,0) o NUMBER(p) sin escala → int  (Oracle)
-    - NUMBER(p,s) con s>0               → float (Oracle)
-    - DOUBLE PRECISION                  → float (PostgreSQL / SQL estándar)
-    - UNSIGNED / SIGNED                 → int   (MySQL modificador de tipo)
+    - NUMBER(p,0) o NUMBER(p) sin escala     → int   (Oracle)
+    - NUMBER(p,s) con s>0                    → float (Oracle)
+    - DECFLOAT(p,0) o DECFLOAT(p) sin escala → int   (DB2)
+    - DECFLOAT(p,s) con s>0 / sin parámetros → float (DB2)
+    - DOUBLE PRECISION                       → float (PostgreSQL / SQL estándar)
+    - UNSIGNED / SIGNED                      → int   (MySQL modificador de tipo)
     """
     raw   = raw_type.strip()
     upper = raw.upper()
@@ -689,8 +720,8 @@ def _sql_to_py(raw_type: str) -> type:
     base   = m.group(1).strip() if m else upper
     params = m.group(2)         if m else None
 
-    # Oracle NUMBER: NUMBER(p,0) → int, NUMBER(p,s>0) → float
-    if base in ("NUMBER",):
+    # Oracle NUMBER / DB2 DECFLOAT: con escala>0 → float, sin escala (o "p,0") → int
+    if base in ("NUMBER", "DECFLOAT"):
         if params:
             parts = [p.strip() for p in params.split(",")]
             if len(parts) == 2:
@@ -698,9 +729,9 @@ def _sql_to_py(raw_type: str) -> type:
                     return int if int(parts[1]) == 0 else float
                 except ValueError:
                     pass
-            # NUMBER(p) sin escala → int
+            # (p) sin escala → int
             return int
-        # NUMBER sin parámetros → float (más seguro)
+        # Sin parámetros → float (más seguro, p.ej. DECFLOAT usado para dinero)
         return float
 
     if base in _INT_TYPES:   return int
@@ -740,6 +771,12 @@ def parse_schema(text: str) -> TableSchema:
 
     RETORNA: TableSchema con pk_column = primera PK detectada (o col[0])
     LANZA:   ValueError solo si no hay columnas en absoluto
+
+    LIMITACIÓN CONOCIDA: una columna sin comillas llamada exactamente `key`
+    o `index` se interpreta como el inicio de una restricción de tabla
+    (igual que lo haría cualquier motor SQL real, donde esas son palabras
+    reservadas). Si necesitan una columna con ese nombre, escríbanla entre
+    comillas/backticks: `key`, "index".
     """
 
     # ── 0. Normalizar saltos de línea ─────────────────────────────────────
@@ -862,7 +899,7 @@ def parse_schema(text: str) -> TableSchema:
         r"ENABLE|DISABLE|NOCHECK|WITH\s+(?:CHECK|NOCHECK)|"
         r"SPARSE|ROWGUIDCOL|FILESTREAM|"
         r"VISIBLE|INVISIBLE|"                  # MySQL 8
-        r"PRIMARY\s+KEY|"                      # inline PK — detectada antes de strip
+        r"PRIMARY\s+KEY"                       # inline PK — detectada antes de strip
         r")\b",
         re.IGNORECASE
     )
@@ -939,10 +976,14 @@ def parse_schema(text: str) -> TableSchema:
             pk_columns.append(cname)
 
         # ── 7d. Extraer tipo ──────────────────────────────────────────────
-        # Quitar PRIMARY KEY del inicio de rest antes de extraer tipo
+        # Quitar PRIMARY KEY del inicio de rest antes de extraer tipo,
+        # luego quitar todos los modificadores inline (NOT NULL, DEFAULT,
+        # AUTO_INCREMENT, UNSIGNED, REFERENCES, etc.) con _INLINE_STRIP,
+        # de modo que solo quede el tipo base con su precisión opcional.
         rest_for_type = re.sub(r"^PRIMARY\s+KEY\s*", "", rest.strip(), flags=re.IGNORECASE).strip()
+        rest_for_type = _INLINE_STRIP.sub(" ", rest_for_type).strip()
         if not rest_for_type:
-            # Solo tenía PRIMARY KEY sin tipo → VARCHAR (SQLite)
+            # Solo tenía PRIMARY KEY / modificadores sin tipo → VARCHAR (SQLite)
             raw_type = "VARCHAR"
         else:
             # Primero intentar tipo de dos palabras
@@ -958,10 +999,8 @@ def parse_schema(text: str) -> TableSchema:
                 raw_type = (type_m.group(1).strip().strip("`")
                             if type_m else "VARCHAR")
 
-        # Limpiar modificadores del tipo (UNSIGNED, etc.) si quedaron pegados
-        raw_type_clean = re.sub(
-            r"\s+(?:UNSIGNED|SIGNED|ZEROFILL)$", "",
-            raw_type, flags=re.IGNORECASE).strip()
+        # Limpiar espacios residuales del tipo
+        raw_type_clean = re.sub(r'\s+', ' ', raw_type).strip()
 
         # ── 7e. ¿NOT NULL? ────────────────────────────────────────────────
         not_null = is_pk or bool(
@@ -1278,11 +1317,23 @@ class DatabaseManager:
                     if col.name not in row:
                         row[col.name] = ""
 
-                casted = self.schema.cast_row(row)
-                pk_val = casted.get(pk_col, "")
+                # ── PK vacía → generar una sintética para no perder el registro ──
+                # IMPORTANTE: se evalúa sobre el valor CRUDO del CSV (antes de
+                # castear). Si se evaluara sobre el valor casteado, una PK
+                # INT/FLOAT vacía se convierte en 0/0.0 (ver ColumnDef.cast) y
+                # esta condición nunca se cumple — bug crítico confirmado que
+                # perdía silenciosamente todas las filas con PK vacía salvo
+                # la primera (las demás se rechazaban como "PK duplicada '0'").
+                raw_pk = row.get(pk_col, "")
+                raw_pk_empty = raw_pk is None or str(raw_pk).strip() == ""
 
-                # PK vacía → generar una sintética para no perder el registro
-                if pk_val == "" or pk_val is None:
+                casted = self.schema.cast_row(row)
+                # Filtrar columnas que no están en el esquema: el aviso dice
+                # "ignoradas", así que deben quedar realmente fuera del
+                # registro guardado (antes contaminaban el disco simulado).
+                casted = {k: v for k, v in casted.items() if k in schema_cols}
+
+                if raw_pk_empty:
                     pk_val = f"__auto_{self.records_loaded}"
                     casted[pk_col] = pk_val
                     if self.records_loaded < 5:
@@ -1290,6 +1341,8 @@ class DatabaseManager:
                             f"Fila {line_num}: PK vacía — asignada clave "
                             f"automática '{pk_val}'."
                         )
+                else:
+                    pk_val = casted.get(pk_col, "")
 
                 # Verificar unicidad de PK antes de almacenar.
                 # Equivalente al check de restricción PRIMARY KEY en un SGBD:
@@ -1332,6 +1385,13 @@ class DatabaseManager:
         if err_rows > 5:
             warnings.append(f"… y {err_rows - 5} fila(s) con error más omitidas.")
 
+        # Invalidar índices AVL cacheados: si load_csv se llama más de una
+        # vez sobre la misma instancia (la GUI actual no lo hace, pero la
+        # API pública de la clase lo permite), los índices construidos antes
+        # de esta carga quedarían desactualizados — bug confirmado y
+        # corregido. Se reconstruyen perezosamente en la próxima búsqueda.
+        self.indices.clear()
+
         # Advertencias del parser SQL (PKs compuestas, etc.)
         if hasattr(self.schema, "_pk_warnings"):
             warnings = self.schema._pk_warnings + warnings
@@ -1343,12 +1403,11 @@ class DatabaseManager:
         Guarda el registro en disco. No toca ningún AVL (lazy indexing).
         row ya viene casteado por schema.cast_row() desde load_csv,
         así que pk_val tiene el tipo correcto directamente.
+        Precondición: load_csv ya validó que pk_val no es vacío ni duplicado.
         """
         raw    = json.dumps(row, ensure_ascii=False).encode("utf-8")
         pk_col = self.schema.pk_column
-        pk_val = row.get(pk_col, "")   # ya casteado — _coerce sería redundante
-        if pk_val == "" or pk_val is None:
-            pk_val = self._coerce(pk_val)   # fallback si el schema no casteó
+        pk_val = row[pk_col]   # siempre presente y casteado por cast_row()
         fragments = self.disk.write_record(raw)
         self._records[pk_val] = {
             "record":    row,
@@ -1872,6 +1931,12 @@ class App(ctk.CTk):
                 self.disk.close()   # cerrar disco anterior
             cfg = DiskConfig(self._vp.get(), self._vt.get(),
                              self._vs.get(), self._vb.get())
+            if cfg.platters <= 0 or cfg.tracks_per_surface <= 0 \
+               or cfg.sectors_per_track <= 0:
+                messagebox.showerror("Error",
+                    "La geometría del disco debe tener al menos 1 plato, "
+                    "1 pista por superficie y 1 sector por pista.")
+                return
             if cfg.usable_bytes < SLOT_SIZE + 1:
                 messagebox.showerror("Error",
                     f"Página demasiado pequeña. Mínimo "
@@ -1937,7 +2002,7 @@ class App(ctk.CTk):
             self._col_menu.configure(values=cols)
             self._col_var.set(self.db.pk_column or cols[0])
             self._draw_disk()
-            self._draw_avl()   # mostrará "índice no existe aún"
+            self._draw_avl()   # muestra "índice no existe aún" (ver _draw_avl)
         except Exception as ex:
             messagebox.showerror("Error al cargar", str(ex))
             self._log(f"ERROR: {ex}", RED)
@@ -2045,9 +2110,8 @@ class App(ctk.CTk):
                     x = PAD + LABEL_W
 
                     for seci in range(cfg.sectors_per_track):
-                        sg_i = pi*2 + si
-                        tg   = sg_i*cfg.tracks_per_surface + ti
-                        pid  = tg*cfg.sectors_per_track + seci
+                        pid = self.disk.address_to_linear(
+                            DiskAddress(pi, si, ti, seci))
 
                         page = self.disk.get_page(pid)
                         pks  = pid_pks.get(pid, set())
@@ -2367,7 +2431,22 @@ class App(ctk.CTk):
         if not self.db: return
 
         col = self._col_var.get()
-        if col.startswith("—") or col not in self.db.indices:
+        if col.startswith("—"):
+            return
+
+        if col not in self.db.indices:
+            # El índice se construye perezosamente en la primera búsqueda
+            # por esta columna. Mientras tanto, avisar en vez de dejar el
+            # lienzo en blanco sin explicación.
+            W = c.winfo_width(); H = c.winfo_height()
+            if W < 10: W = 600
+            if H < 10: H = 200
+            c.create_text(W//2, H//2,
+                          text=f"Índice de '{col}' aún no construido —\n"
+                               f"realiza una búsqueda por esta columna "
+                               f"para generarlo.",
+                          fill=MUTED, font=("Consolas",10),
+                          justify="center", anchor="center")
             return
 
         avl    = self.db.indices[col]
@@ -2392,7 +2471,7 @@ class App(ctk.CTk):
                           text=f"Demasiados nodos para dibujar (límite: {self.AVL_DRAW_LIMIT})",
                           fill=MUTED, font=("Consolas",10), anchor="center")
             c.create_text(W//2, H//2 + 26,
-                          text=f"Altura: {avl._h(avl.root)}  |  "
+                          text=f"Altura: {avl._height(avl.root)}  |  "
                                f"Nodos únicos: {avl.size}  |  "
                                f"Col: {col}",
                           fill=ACCENT, font=("Consolas",9), anchor="center")
@@ -2431,11 +2510,8 @@ class App(ctk.CTk):
                 if col == pk_col:
                     node_hi = nd["key"] in hl
                 else:
-                    node_hi = bool(set(nd.get("values_preview", [])) & hl)
-                    # fallback: check via avl search
-                    if not node_hi:
-                        found_pks = avl.search(nd["key"])
-                        node_hi   = bool(set(found_pks) & hl)
+                    found_pks = avl.search(nd["key"])
+                    node_hi   = bool(set(found_pks) & hl)
 
                 c.create_oval(x-NR,y-NR,x+NR,y+NR,
                               fill=YELLOW_H if node_hi else ACCENT2_D,
@@ -2454,7 +2530,7 @@ class App(ctk.CTk):
         is_pk = col == pk_col
         c.create_text(8, H-14, anchor="nw",
                       text=f"AVL [{col}]  {'(PK — primario)' if is_pk else '(secundario)'}  |  "
-                           f"nodos únicos: {avl.size}  |  altura: {avl._h(avl.root)}",
+                           f"nodos únicos: {avl.size}  |  altura: {avl._height(avl.root)}",
                       fill=MUTED, font=("Consolas",8))
 
 
